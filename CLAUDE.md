@@ -158,10 +158,26 @@ Note: **POST**, not GET (a GET returns 405). Body can be `{}`.
 
 → **200** `{"limit": n, "total": <n>, "offset": 0, "items": [
 {"id": …, "date": "YYYY-MM-DD", "tag": …, "collectorUnit": …,
-"employee": …, "status": "PROCESSED"}, … ]}`
+"employee": …, "status": "PROCESSED" | "PROCESSED_DUPLICATE"}, … ]}`
 
-Newest first. `total` is the lifetime count of registered cycling days —
-the cheapest way to get "days cycled ever" is `limit=1` and read `total`.
+Newest first. `limit` is honoured up to at least 500 and echoed back
+verbatim, so a whole account's history is normally one request.
+
+**`total` is a count of tag reads, not of cycling days** — corrected
+2026-09-07, the original capture had this wrong. A collector unit sometimes
+reads the same tag twice on one day; the second read is stored as a full
+event row with `"status": "PROCESSED_DUPLICATE"` and earns no points. The
+probed account had **155 rows: 131 `PROCESSED` and 24
+`PROCESSED_DUPLICATE`**, over exactly 131 distinct dates — and exactly 131
+`INCOME_DISTANCE` transactions, which is what confirms the duplicates are
+uncredited rather than merely relabelled.
+
+So "days cycled ever" is *not* `limit=1` + `total`; that overstates it by the
+duplicate count (155 vs 131 here, an 18% error). Fetch the rows and count
+distinct non-duplicate dates. Treat the status vocabulary as open the same
+way as the transaction types: filter *out* the known duplicate marker rather
+than filtering *in* an exhaustive list of good ones, so an unseen third
+status still counts as a cycling day instead of silently vanishing.
 
 ### Points transactions
 
@@ -176,10 +192,17 @@ Authorization: Bearer <token>
 "description": " 01 september 2026", "subcontract": …, "skipDate": null},
 … ]}`
 
-Newest first. `type` seen live: `INCOME_DISTANCE` (points credited for a
-cycling day). Spending an order presumably produces a negative amount with
-`articleOrder` set and a different `type` — **not observed live**, so treat
-the type vocabulary as open and don't branch exhaustively on it.
+Newest first. Types seen live (updated 2026-09-07): `INCOME_DISTANCE`
+(points credited for a cycling day, positive `amount`) and **`EXPENSE_ORDER`**
+(points spent in the webshop, **negative** `amount`, `articleOrder` set to the
+order's id). The earlier note that spending was "not observed live" is
+superseded — on the probed account, 137 transactions were 131
+`INCOME_DISTANCE` plus 6 `EXPENSE_ORDER`, matching its 6 orders exactly.
+
+Still treat the vocabulary as open and don't branch exhaustively on it: the
+integration keys off the **sign of `amount`**, not the type name, so a third
+type appearing later lands on the right side of "earned" vs "spent" without a
+code change.
 
 Points per cycling day are employer- and distance-dependent — one probed
 account earned 154 points/day. Read the rate from the data if you need it;
@@ -214,8 +237,13 @@ points = €1), `articleLines[]` with `trapperPrice`, plus `mutationLogs[]`
 containing the ordering person's **name**.
 
 **Careful with this endpoint**: it is the only place the points→euro
-conversion ratio appears, but the response also carries names and (in some
-shapes) an IBAN field. If a euro-value sensor is wanted, read only
+conversion ratio appears, but the response also carries names and an IBAN
+field. Confirmed live 2026-09-07 — an order item's keys are `id`,
+`orderNumber`, `orderDate`, `articleOrderStatus`, `articleLines`,
+`mutationLogs`, `exportDate`, `orderCancelledDate`, `bookHandlingCostsDate`,
+`trapperToEuroConversionRatio`, **`employee_id`** and **`ibanAccountNumber`**.
+That is the worst response in the API to handle carelessly. If a euro-value
+sensor is wanted, read only
 `trapperToEuroConversionRatio` from the newest order and drop the rest —
 and handle "no orders yet" (`total: 0`), where the ratio is simply unknown.
 Don't hardcode 0.01: it is one employer's contract term, not a constant.
@@ -258,6 +286,84 @@ calling.
   `strings.json` (source/English) plus `translations/en.json` and
   `translations/nl.json`. Dutch matters here: the service itself is
   Dutch-only.
+
+## Design decisions made while building it
+
+Implemented and deployed 2026-09-07 (v0.1.0): seven sensors, verified
+end-to-end against the live account and read back off a real Home Assistant
+instance. The two API-contract corrections above came out of that work; these
+are the choices the code makes that the contract alone doesn't dictate.
+
+- **Sensor set.** `balance`, `balance_value_eur`, `cycling_days_total`,
+  `cycling_days_this_month`, `last_cycling_day`, `points_earned_this_month`,
+  `commute_distance`. All seven are supported honestly — none had to be
+  dropped.
+
+- **A poll is four requests, not one.** `/status` alone answers the headline
+  balance, but the activity sensors need `/events`, `/transactions` and
+  `/commute` too. `/articleOrders` is the fifth and is deliberately *not* on
+  every cycle — see below. At a 30-minute interval that is ~200 requests a
+  day, which is still a gentle citizen for this API.
+
+- **`/articleOrders` is fetched at most once a day while the ratio is known,
+  and every poll while it is unknown.** That asymmetry is a privacy rule, not
+  a caching heuristic: the response for an account *with* orders is the one
+  carrying names and `ibanAccountNumber`, so it is pulled as rarely as the
+  data allows; the response for an account *without* orders is
+  `{"total": 0, "items": []}`, which carries nothing, so retrying it costs
+  nothing and picks up the first order promptly. `ORDER_RATIO_MAX_AGE` in
+  `api.py`.
+
+- **`balance_value_eur` is `unknown`, never 0, on an account with no orders.**
+  The ratio only exists on order records. 0.01 is one employer's contract
+  term; defaulting to it would invent a number the API never returned.
+
+- **Month boundaries follow Home Assistant's clock, not the container's.**
+  `api.py` is HA-independent and takes `today`/`now` as arguments;
+  `coordinator.py` passes `dt_util.now()`. Without that, a UTC container would
+  roll the "this month" sensors over at the wrong local moment. `api.py`
+  defaults to `date.today()` so it stays usable (and testable) outside HA.
+
+- **Token handling is 401-driven re-login, not scheduled refresh.** The JWT
+  lives four hours and `/api/security/token-refresh` exists, but a poll that
+  gets a 401 simply logs in again and retries once. At a 30-minute interval
+  that is one extra round-trip roughly every eighth poll, in exchange for no
+  expiry bookkeeping. A second 401 straight after a successful login raises
+  `TrappersApiError`, not `TrappersAuthError` — re-entering the password
+  cannot fix that, so routing it through reauth would be a dead end.
+
+- **Paging is bounded, and hitting the bound is an error.** `/events` is
+  fetched whole (needed for both the lifetime and the this-month count) at
+  `limit=500`, capped at 20 pages; `/transactions` pages at 100 until a page
+  reaches into last month, capped at 12. The caps exist so a paging bug or a
+  changed `total` becomes a clean `UpdateFailed` rather than an unbounded
+  request loop against someone else's API.
+
+- **Icon is an original mark, not Trappers' or FiscFree's.**
+  `custom_components/trappers/brand/icon.svg` (+ rasterized
+  `icon.png`/`icon@2x.png`/`logo.png`/`logo@2x.png`) is a bicycle whose front
+  wheel is a points token, on a deep indigo (`#4C3E8E`→`#2E2559`) chosen
+  precisely because it is nowhere near the greens and teals Dutch cycling-
+  benefit brands use — so it reads as related-but-unofficial. Served straight
+  out of the integration package by HA's own `/api/brands/` endpoint on
+  2026.3.0+ (`hacs.json`'s `homeassistant` floor is set there for this
+  reason); confirmed working in the live Add-Integration dialog, so no
+  `home-assistant/brands` PR is needed.
+
+- **Tests use a hand-rolled fake `aiohttp.ClientSession`.** Not `aioresponses`
+  — as of 0.7.9 it is incompatible with the aiohttp version HA pins
+  (`ClientResponse.__init__()` gained a required `stream_writer` kwarg it
+  doesn't pass), so every test using it fails with a `TypeError` unrelated to
+  the code under test. Same conclusion, same reason, as `ha-50plusmobiel`.
+  `tests/test_coordinator.py`, `test_config_flow.py` and `test_sensor.py` use
+  `pytest-homeassistant-custom-component`'s real in-memory `hass` instead, and
+  `test_coordinator.py` imports `config_flow` before the test so the handler is
+  registered — otherwise `async_start_reauth_if_available()` silently no-ops
+  and the reauth assertion passes for the wrong reason.
+
+- **Local test venv is Python 3.14** (`uv venv --python 3.14 .venv`),
+  matching what recent Home Assistant requires. The system Python 3.11 cannot
+  install `pytest-homeassistant-custom-component`.
 
 ## Cutting a release
 

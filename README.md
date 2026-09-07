@@ -44,7 +44,32 @@ follow your Home Assistant instance's configured language automatically.
 
 ## Sensors
 
-_Populated once the integration is built — see `custom_components/trappers/`._
+One device per account, with seven sensors on it. Entity names follow your
+Home Assistant language (English and Dutch ship with the integration).
+
+| Sensor | Unit | Description |
+|---|---|---|
+| Points balance | trappers | Your current points balance — the headline number. |
+| Points balance value | € | The balance converted to euros. `unknown` until the account has placed at least one order (see below). |
+| Cycling days total | — | Cycling days registered since you joined the scheme. |
+| Cycling days this month | — | Cycling days in the current calendar month. Resets on the 1st. |
+| Last cycling day | date | The most recent day a collector unit registered your bike. |
+| Points earned this month | trappers | Points credited so far this calendar month. Points *spent* in the webshop are not subtracted. |
+| Commute distance | km | Your registered one-way commute distance. `unknown` if no commute is registered. |
+
+### Two things worth knowing about the numbers
+
+**Cycling days are counted, not totalled.** A collector unit sometimes reads
+the same tag twice in a day. Trappers stores that as a second entry, marked as
+a duplicate, which earns no points — so the raw entry count runs ahead of the
+number of days you actually cycled. Both cycling-day sensors count distinct,
+non-duplicate days, which is the figure that matches the points you were paid.
+
+**The euro value needs an order to exist.** The points-to-euro rate is part of
+the contract between your employer and FiscFree, and the API only reveals it on
+an order record. On an account that has never ordered anything there is no rate
+to read, so "Points balance value" stays `unknown` rather than showing a made-up
+number. It fills in by itself after your first order.
 
 ## Polling
 
