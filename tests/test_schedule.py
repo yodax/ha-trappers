@@ -358,7 +358,7 @@ class TestJitteredSlots:
                 poll = next_poll_time(local(2026, 9, 7, hour, 30), jitter)
                 assert poll >= local(2026, 9, 7, 8)
 
-    def test_dst_handling_is_unaffected_by_the_offset(self) -> None:
+    def test_spring_forward_composes_with_the_offset(self) -> None:
         now = local(2026, 3, 28, 20, 30)
 
         assert next_poll_time(now, self.JITTER) == local(2026, 3, 29, 8, 7)
@@ -366,6 +366,46 @@ class TestJitteredSlots:
         assert interval_until_next_poll(now, self.JITTER) == timedelta(
             hours=10, minutes=37
         )
+
+    def test_fall_back_composes_with_the_offset(self) -> None:
+        """The offset must not be lost or doubled when the clock repeats an hour."""
+        now = local(2026, 10, 24, 20, 30)
+
+        assert next_poll_time(now, self.JITTER) == local(2026, 10, 25, 8, 7)
+        # 20:30 CEST -> 08:07 CET gains an hour of real time.
+        assert interval_until_next_poll(now, self.JITTER) == timedelta(
+            hours=12, minutes=37
+        )
+
+    @pytest.mark.parametrize("day", [(2026, 3, 29), (2026, 10, 25)], ids=["spring", "autumn"])
+    def test_every_slot_on_a_transition_day_keeps_its_offset(self, day: tuple) -> None:
+        cursor = local(*day, 0)
+        reached = []
+        for _ in range(len(POLL_HOURS)):
+            cursor = next_poll_time(cursor, self.JITTER)
+            reached.append((cursor.hour, cursor.minute))
+
+        assert reached == [(hour, 7) for hour in POLL_HOURS]
+
+    def test_the_offset_can_never_reach_the_following_slot(self) -> None:
+        """Guards a future widening of MAX_POLL_JITTER.
+
+        The offset is added after each slot, so an offset as large as the gap
+        between two slots would let one poll overrun the next and silently drop
+        a slot from the day. Nothing else in the code enforces that bound, so it
+        is asserted here rather than assumed.
+        """
+        gaps = [
+            timedelta(hours=b - a) for a, b in zip(POLL_HOURS, POLL_HOURS[1:])
+        ]
+        assert MAX_POLL_JITTER < min(gaps)
+
+        # And concretely: the largest possible offset still lands each poll
+        # inside its own slot's window.
+        largest = MAX_POLL_JITTER - timedelta(seconds=1)
+        for hour in POLL_HOURS:
+            poll = next_poll_time(local(2026, 9, 7, hour, 0) - timedelta(seconds=1), largest)
+            assert poll.hour == hour
 
     def test_interval_is_still_clamped(self) -> None:
         # Waking exactly on the offset moment.
