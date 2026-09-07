@@ -172,8 +172,9 @@ class TrappersApiClient:
         The token is valid for four hours. Rather than tracking its expiry,
         this client re-logs-in when a request comes back 401 (see
         ``_async_request``) — one fewer moving part than a scheduled refresh,
-        and at an hourly poll interval it costs one extra round-trip roughly
-        every fourth poll.
+        With poll slots three hours apart the token has always expired by the
+        next poll, so in practice this is one extra round-trip per poll — five
+        a day — in exchange for no expiry bookkeeping.
 
         The login response's ``userDetails`` object carries the whole account
         holder — name, address, telephone number, employer employee numbers.

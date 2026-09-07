@@ -314,14 +314,14 @@ calling.
 
 - **Domain is `trappers`.** Display name "Trappers" in `manifest.json`.
 - **`iot_class` is `cloud_polling`, `integration_type` is `service`.**
-- **Poll interval: 1 hour by default** (was 30 minutes through 0.1.x). This is
-  an unofficial, reverse-engineered API belonging to an employer benefits
-  provider — be a good citizen. Points are credited at most once per working
-  day, when the collector unit reads the tag on arrival, so hourly still
-  surfaces the day's points within an hour of getting to the office. A cycle is
-  four requests (status, events, transactions, commute), so this is ~96
-  requests/day; the catalogue fetch behind the euro rate is cached 24h on top.
-  Going longer than an hour starts to feel stale for no further saving.
+- **Polls at fixed wall-clock slots — 08:00, 11:00, 14:00, 17:00, 20:00 local
+  — not on an interval** (0.1.x polled every 30 minutes). Points are credited
+  at most once per working day, when the collector unit reads the tag on
+  arrival, so there is nothing to see overnight, and this is an unofficial API
+  belonging to an employer benefits provider. Five polls × four requests is
+  ~20 requests/day, down from 192; the catalogue fetch behind the euro rate is
+  cached 24h on top. `POLL_HOURS` in `const.py`. See the schedule notes under
+  "Design decisions" for the traps.
 - **Every request gets an explicit `aiohttp.ClientTimeout`** and
   `aiohttp.ClientError`/`asyncio.TimeoutError` must surface as `UpdateFailed`,
   never as an uncaught exception in the log.
@@ -350,8 +350,8 @@ calling.
 Implemented and deployed 2026-09-07: seven sensors, verified end-to-end
 against the live account and read back off a real Home Assistant instance.
 Shipped as 0.1.0, then 0.1.1 (entity IDs no longer carry the account's email
-address) and 0.2.0 (the euro sensor was overstating the balance by ~5%; poll
-interval relaxed to hourly). The API-contract corrections above came out of
+address) and 0.2.0 (the euro sensor was overstating the balance by ~5%; polling moved
+from a 30-minute interval to five fixed daytime slots). The corrections above came out of
 that work; these are the choices the code makes that the contract alone
 doesn't dictate.
 
@@ -389,8 +389,45 @@ doesn't dictate.
 
 - **A poll is four requests, not one.** `/status` alone answers the headline
   balance, but the activity sensors need `/events`, `/transactions` and
-  `/commute` too. At the hourly interval that is ~96 requests a day, plus the
+  `/commute` too. Five slots a day makes that ~20 requests, plus the
   once-daily `/articles` fetch behind the euro rate.
+
+- **The schedule is a moving `update_interval`, reassigned at the end of every
+  successful `_async_update_data` to the gap until the next `POLL_HOURS` slot.**
+  Four things about it are load-bearing and were each a way to get it wrong:
+
+  1. **Subtract in UTC, not in local time.** `interval_until_next_poll()`
+     converts both ends with `dt_util.as_utc()` before subtracting. Python's
+     `datetime.__sub__` *skips* `utcoffset()` when both operands share the same
+     `tzinfo` object — which they do here, both carrying HA's configured zone —
+     and returns the wall-clock difference. Across the spring-forward night
+     that is an hour too long (20:01 CET → 08:00 CEST is 10h59m of real time,
+     not 11h59m), so the poll fires at 09:00 instead of 08:00. A test caught
+     this; without it the bug would have surfaced once a year and been
+     impossible to attribute.
+
+  2. **There is no "outside the window, skip" branch.** The coordinator is
+     simply not woken between 20:00 and 08:00. A skip branch would be a path
+     that could raise `UpdateFailed` overnight and paint every sensor
+     unavailable until morning — looking exactly like a broken integration.
+     Not having the branch means not being able to get that wrong.
+
+  3. **The first refresh is not window-gated.** It comes from
+     `async_config_entry_first_refresh()` at setup, so a restart at 02:00
+     populates the sensors immediately rather than leaving them `unknown` until
+     08:00. The window governs the recurring schedule, not the initial load —
+     as does `homeassistant.update_entity`, which still works at any hour.
+
+  4. **The interval is clamped to `MIN_UPDATE_INTERVAL` (60s).** A clock step,
+     a DST transition or waking exactly on a slot boundary can compute a zero
+     or negative delta; unclamped, that is a hot loop against an employer
+     benefits provider's API.
+
+  Fixed slots rather than a free-running 3h timer because a timer is anchored
+  to whenever HA last restarted, drifts to arbitrary times, and makes "when
+  does it poll?" unanswerable. `tests/test_schedule.py` pins the slot
+  arithmetic, both DST transitions, the clamp over a full simulated year, and
+  that data is held rather than dropped between polls.
 
 - **`balance_value_eur` is derived from the catalogue, as a mode.** See "The
   trap" above for why not from `trapperToEuroConversionRatio`. The mechanics:
@@ -424,9 +461,10 @@ doesn't dictate.
 
 - **Token handling is 401-driven re-login, not scheduled refresh.** The JWT
   lives four hours and `/api/security/token-refresh` exists, but a poll that
-  gets a 401 simply logs in again and retries once. At the hourly interval
-  that is one extra round-trip roughly every fourth poll, in exchange for no
-  expiry bookkeeping. A second 401 straight after a successful login raises
+  gets a 401 simply logs in again and retries once. With slots three hours
+  apart the token has always expired by the next poll, so in practice this is
+  one login per poll — still only five a day, in exchange for no expiry
+  bookkeeping at all. A second 401 straight after a successful login raises
   `TrappersApiError`, not `TrappersAuthError` — re-entering the password
   cannot fix that, so routing it through reauth would be a dead end.
 

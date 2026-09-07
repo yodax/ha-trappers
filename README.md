@@ -88,19 +88,30 @@ If the catalogue ever stops having one consistent rate, the sensor reads
 
 ## Polling
 
-Each account polls **once an hour**. That is a deliberately conservative
-default for an unofficial API belonging to an employer benefits provider, and
-nothing is lost by it: points are credited at most once per working day, when
-the collector unit reads your bike tag as you arrive, so the day's points show
-up within an hour of you getting there.
+Each account polls **five times a day — at 08:00, 11:00, 14:00, 17:00 and
+20:00** in your Home Assistant timezone. Nothing overnight.
+
+Points are credited at most once per working day, when the collector unit
+reads your bike tag as you arrive at the office, so there is genuinely nothing
+to see between 20:00 and 08:00. This is an unofficial API belonging to an
+employer benefits provider, and polling it 48 times a day to catch one event
+would be rude.
+
+The slots are fixed wall-clock times rather than a free-running three-hour
+timer, so "when does it poll?" has an answer that does not depend on when you
+last restarted Home Assistant. Across the daylight-saving changes one gap is
+an hour shorter or longer in real time — the slots stay at 08:00 and 20:00
+local, which is the point.
 
 A poll is four requests (balance, cycling days, transactions, commute). The
 webshop catalogue behind the euro value is read at most once a day on top of
-that, since the rate is a contract term that does not move.
+that, since the rate is a contract term that does not move. That is about 20
+requests a day in total.
 
-Trigger an immediate refresh from **Developer tools → Actions →
-`homeassistant.update_entity`** or the reload button on the integration's
-entry.
+Your sensors keep their values between polls; they do not go unavailable
+overnight. And you can always force an immediate refresh at any hour from
+**Developer tools → Actions → `homeassistant.update_entity`** or the reload
+button on the integration's entry.
 
 ## Privacy
 
