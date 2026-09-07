@@ -56,7 +56,7 @@ def _active_reauth_flows(hass: HomeAssistant) -> list:
 
 
 async def test_successful_update_stores_data(hass: HomeAssistant) -> None:
-    data = {"balance": 7574.0}
+    data = {"balance": 10000.0}
     coordinator, _entry, _client = _setup_coordinator(hass, result=data)
 
     await coordinator.async_refresh()

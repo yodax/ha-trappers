@@ -1,5 +1,11 @@
 # Trappers for Home Assistant
 
+[![HACS: custom repository](https://img.shields.io/badge/HACS-custom%20repository-41BDF5.svg)](https://hacs.xyz/)
+[![Release](https://img.shields.io/github/v/release/yodax/ha-trappers?display_name=tag)](https://github.com/yodax/ha-trappers/releases)
+[![Validate](https://github.com/yodax/ha-trappers/actions/workflows/validate.yml/badge.svg)](https://github.com/yodax/ha-trappers/actions/workflows/validate.yml)
+[![Test](https://github.com/yodax/ha-trappers/actions/workflows/test.yml/badge.svg)](https://github.com/yodax/ha-trappers/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Custom Home Assistant integration for
 [Trappers](https://fiscfree.nl/onze-oplossingen/fietsstimulering/) — the Dutch
 employer bike-to-work scheme run by FiscFree, where every day you commute by
@@ -21,8 +27,14 @@ Requires **Home Assistant 2026.3.0 or newer**.
 
 ### HACS
 
-HACS → ⋮ → Custom repositories → add this repository's URL, category
-"Integration" → install "Trappers" → restart Home Assistant.
+This is **not in the HACS default store**, so add it as a custom repository
+first:
+
+[![Open your Home Assistant instance and open this repository inside HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=yodax&repository=ha-trappers&category=integration)
+
+Or by hand: HACS → ⋮ → Custom repositories → paste this repository's URL,
+category "Integration" → Add. Then find "Trappers" in HACS, install it, and
+restart Home Assistant.
 
 ### Manual / direct-copy
 
@@ -30,6 +42,8 @@ Copy `custom_components/trappers/` into your Home Assistant
 `config/custom_components/` directory and restart Home Assistant.
 
 ## Configuration
+
+[![Open your Home Assistant instance and start setting up a new integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=trappers)
 
 Settings → Devices & Services → Add Integration → "Trappers", then enter the
 email address and password you use on `trappersshop.fiscfree.nl`.
@@ -73,7 +87,8 @@ it overstated the balance by about 5%.
 
 "Points balance value" instead reads the webshop catalogue and works out what
 the points buy: a "bol. cadeaukaart € 25" costing 2625 points is 105 points per
-euro, so a balance of 7574 points is worth € 72,13. The rate is read from your
+euro, so a balance of 10 000 points is worth € 95,24 — not the € 100,00 the
+scheme's own ratio would have claimed. The rate is read from your
 own employer's catalogue, never assumed — it is a contract term and it differs
 between employers.
 
@@ -130,6 +145,17 @@ the ordering person's name and a bank account number, and nothing here needs
 it. See the "Privacy" and "Design constraints" sections of
 [`CLAUDE.md`](CLAUDE.md). Nothing account-specific is committed to this
 repository, and a pre-commit hook (`.githooks/pre-commit`) enforces that.
+
+## Contributing
+
+Issues and pull requests are welcome. Two things to know before you open one:
+
+- **Redact before you paste.** The API returns a home address, telephone
+  number, employer employee numbers and an email address on nearly every call,
+  and entity IDs can carry a name. The issue templates say this too.
+- **Tests are expected to pass and to come with changes.** `pytest tests/`
+  runs against local fakes, so you do not need a Trappers account to work on
+  this.
 
 ## Running tests
 

@@ -505,8 +505,8 @@ class TrappersApiClient:
         account, ``purchasePrice / trappersPrice`` was exactly 0.01 for every
         single one — the ratio simply reproduces ``purchasePrice`` by
         construction. Valuing the balance with it overstates it by the
-        operator's margin: 7574 points came out as €75.74, while the same 7574
-        points buy €72.13 of gift cards in the actual shop.
+        operator's margin: a 10 000-point balance came out as €100.00, while
+        the same points buy €95.24 of gift cards in the actual shop.
 
         The rate that can be spent is ``trappersPrice`` per euro of **face**
         value: a "bol. cadeaukaart € 25" costs 2625 points, so 105 points per

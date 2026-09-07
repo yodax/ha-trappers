@@ -169,7 +169,7 @@ async def _coordinator(hass: HomeAssistant) -> TrappersCoordinator:
     )
     entry.add_to_hass(hass)
     client = AsyncMock(spec=TrappersApiClient)
-    client.async_get_data.return_value = {"balance": 7574.0}
+    client.async_get_data.return_value = {"balance": 10000.0}
     return TrappersCoordinator(hass, entry, client)
 
 
@@ -205,7 +205,7 @@ async def test_first_refresh_happens_even_outside_the_window(hass: HomeAssistant
 
     await coordinator.async_refresh()
 
-    assert coordinator.data == {"balance": 7574.0}
+    assert coordinator.data == {"balance": 10000.0}
     assert coordinator.client.async_get_data.await_count == 1
 
 
@@ -223,19 +223,19 @@ async def test_data_is_held_between_polls_not_dropped(hass: HomeAssistant) -> No
     coordinator.update_interval = timedelta(hours=12)
 
     assert coordinator.last_update_success is True
-    assert coordinator.data == {"balance": 7574.0}
+    assert coordinator.data == {"balance": 10000.0}
 
 
 async def test_manual_refresh_works_at_any_hour(hass: HomeAssistant) -> None:
     """`homeassistant.update_entity` is the escape hatch and is not window-gated."""
     coordinator = await _coordinator(hass)
     await coordinator.async_refresh()
-    coordinator.client.async_get_data.return_value = {"balance": 7728.0}
+    coordinator.client.async_get_data.return_value = {"balance": 10154.0}
 
     await coordinator.async_request_refresh()
     await hass.async_block_till_done()
 
-    assert coordinator.data == {"balance": 7728.0}
+    assert coordinator.data == {"balance": 10154.0}
     assert coordinator.client.async_get_data.await_count == 2
     # async_request_refresh() debounces, which leaves a timer behind.
     await coordinator.async_shutdown()

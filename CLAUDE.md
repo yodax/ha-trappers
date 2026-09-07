@@ -250,8 +250,8 @@ This is worth reading before "simplifying" the euro sensor back.
 
 `/api/articleOrders` carries a field called `trapperToEuroConversionRatio`
 (0.01 on the probed account). It is named like the answer, it looks like the
-answer, and 0.1.0 used it: `balance × 0.01`, giving €75.74 for a 7574-point
-balance. It is wrong, and it is wrong in the direction that flatters.
+answer, and 0.1.0 used it: `balance × 0.01`, giving €100.00 for a
+10 000-point balance. It is wrong, and it is wrong in the direction that flatters.
 
 It is an **identity**. Across all 99 catalogue articles,
 `purchasePrice / trappersPrice` was exactly `0.01` for every single one — the
@@ -262,8 +262,9 @@ operator's margin, ~5%.
 The rate that can actually be spent is `trappersPrice` per euro of **face**
 value, taken off the article name — `"bol. cadeaukaart € 25"` at
 `trappersPrice: 2625` is **105 points per euro**. Uniform across all 59
-priced articles on the probed account, with no outliers. 7574 / 105 = €72.13,
-which is what the shop actually charges.
+priced articles on the probed account, with no outliers. 10 000 / 105 =
+€95.24, which is what the shop actually charges — ~5% under what the ratio
+claimed.
 
 **Nobody would have caught this from the API alone.** Both numbers are
 internally consistent; the ratio genuinely is a real field with a real

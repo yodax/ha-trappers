@@ -93,7 +93,7 @@ def login_ok(token: str = "jwt-1", first_name: object = "Alex") -> FakeResponse:
     return FakeResponse(
         json_data={
             "token": token,
-            "userDetails": {"balance": 7574.0, "firstName": first_name},
+            "userDetails": {"balance": 10000.0, "firstName": first_name},
         }
     )
 
@@ -207,7 +207,7 @@ def responses(**overrides: list[FakeResponse]) -> dict[str, list[FakeResponse]]:
     """A full happy-path response map, with per-endpoint overrides."""
     base = {
         LOGIN_URL: [login_ok()],
-        STATUS_URL: [FakeResponse(json_data={"balance": 7574.0, "employee": {}})],
+        STATUS_URL: [FakeResponse(json_data={"balance": 10000.0, "employee": {}})],
         EVENTS_URL: [page(DEFAULT_EVENTS)],
         TRANSACTIONS_URL: [page(DEFAULT_TRANSACTIONS, limit=100)],
         COMMUTE_URL: [page(DEFAULT_COMMUTE, limit=100)],
@@ -310,16 +310,16 @@ class TestAsyncGetData:
         data = await client.async_get_data(today=TODAY, now=NOW)
 
         assert data == {
-            "balance": 7574.0,
+            "balance": 10000.0,
             # 5 event rows, one of which is a duplicate tag read → 4 days.
             "cycling_days_total": 4,
             "last_cycling_day": date(2026, 9, 1),
             "cycling_days_this_month": 1,
             "points_earned_this_month": 154.0,
             "commute_distance": 11.0,
-            # 7574 / 105 pt-per-euro. NOT 7574 * 0.01 — see
+            # 10000 / 105 pt-per-euro. NOT 10000 * 0.01 — see
             # test_euro_value_uses_the_shop_rate_not_the_accounting_ratio.
-            "balance_value_eur": 72.13,
+            "balance_value_eur": 95.24,
         }
 
     async def test_duplicate_tag_reads_do_not_count_as_cycling_days(self) -> None:
@@ -441,7 +441,7 @@ class TestAsyncGetData:
         assert data["commute_distance"] is None
 
     async def test_euro_value_uses_the_shop_rate_not_the_accounting_ratio(self) -> None:
-        """7574 points buy €72.13 of gift cards, not €75.74.
+        """10 000 points buy €95.24 of gift cards, not €100.00.
 
         `/articleOrders`'s `trapperToEuroConversionRatio` (0.01) is the scheme's
         internal cost basis — across the whole live catalogue,
@@ -454,8 +454,8 @@ class TestAsyncGetData:
 
         data = await client.async_get_data(today=TODAY, now=NOW)
 
-        # 7574 / 105, not 7574 * 0.01.
-        assert data["balance_value_eur"] == 72.13
+        # 10000 / 105, not 10000 * 0.01.
+        assert data["balance_value_eur"] == 95.24
 
     async def test_articleorders_is_never_requested(self) -> None:
         """It carries the ordering person's name and an ibanAccountNumber."""
@@ -482,7 +482,7 @@ class TestAsyncGetData:
 
         data = await client.async_get_data(today=TODAY, now=NOW)
 
-        assert data["balance_value_eur"] == 72.13
+        assert data["balance_value_eur"] == 95.24
 
     async def test_a_single_mispriced_article_cannot_move_the_rate(self) -> None:
         """The mode survives an outlier; a mean would not."""
@@ -493,7 +493,7 @@ class TestAsyncGetData:
 
         data = await client.async_get_data(today=TODAY, now=NOW)
 
-        assert data["balance_value_eur"] == 72.13
+        assert data["balance_value_eur"] == 95.24
 
     async def test_a_non_uniform_catalogue_is_unknown_not_an_average(self) -> None:
         """Two rates means the single-rate model is wrong — say unknown.
@@ -555,7 +555,7 @@ class TestAsyncGetData:
 
         data = await client.async_get_data(today=TODAY, now=NOW)
 
-        assert data["balance_value_eur"] == 72.13
+        assert data["balance_value_eur"] == 95.24
 
     async def test_known_rate_is_reused_for_a_day(self) -> None:
         """It is a contract term; re-deriving it every poll re-fetches 99 articles."""
@@ -591,7 +591,7 @@ class TestAsyncGetData:
         second = await client.async_get_data(today=TODAY, now=NOW + timedelta(hours=1))
 
         assert first["balance_value_eur"] is None
-        assert second["balance_value_eur"] == 72.13
+        assert second["balance_value_eur"] == 95.24
         assert len([c for c in session.calls if c[1] == ARTICLES_URL]) == 2
 
     async def test_no_cycling_days_at_all(self) -> None:
@@ -612,7 +612,7 @@ class TestTokenHandling:
                     LOGIN_URL: [login_ok(), login_ok("jwt-2")],
                     STATUS_URL: [
                         FakeResponse(status=401),
-                        FakeResponse(json_data={"balance": 7574.0, "employee": {}}),
+                        FakeResponse(json_data={"balance": 10000.0, "employee": {}}),
                     ],
                 }
             )
@@ -620,7 +620,7 @@ class TestTokenHandling:
 
         data = await client.async_get_data(today=TODAY, now=NOW)
 
-        assert data["balance"] == 7574.0
+        assert data["balance"] == 10000.0
         assert len([c for c in session.calls if c[1] == LOGIN_URL]) == 2
 
     async def test_still_401_after_reauth_is_an_api_error_not_an_auth_error(self) -> None:

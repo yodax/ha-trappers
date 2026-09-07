@@ -1,0 +1,51 @@
+name: Bug report
+description: Something in the integration is not working
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before you paste anything:** the Trappers API returns your home
+        address, telephone number, employer employee numbers and an email
+        address on nearly every call. Please redact those from any log,
+        diagnostic or screenshot you attach — and note that entity IDs and
+        dashboard YAML can carry your name too.
+
+        This integration never logs those fields itself, but debug logs from
+        other components might.
+  - type: input
+    id: version
+    attributes:
+      label: Integration version
+      description: Shown on the Trappers card under Settings → Devices & Services.
+      placeholder: "0.2.1"
+    validations:
+      required: true
+  - type: input
+    id: ha_version
+    attributes:
+      label: Home Assistant version
+      placeholder: "2026.9.0"
+    validations:
+      required: true
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you get instead?
+    validations:
+      required: true
+  - type: textarea
+    id: sensors
+    attributes:
+      label: Which sensors are affected, and what do they read?
+      description: e.g. "Points balance value is unknown, the rest are fine."
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: |
+        Enable debug logging under Settings → Devices & Services → Trappers →
+        ⋮ → Enable debug logging, reproduce, then disable it and attach the
+        download. Redact anything personal first.
+      render: text

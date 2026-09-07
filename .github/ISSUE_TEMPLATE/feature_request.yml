@@ -1,0 +1,18 @@
+name: Feature request
+description: Suggest a sensor or behaviour
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+  - type: textarea
+    id: data
+    attributes:
+      label: Where would the data come from?
+      description: |
+        If you know which API response holds it, say so. Note that this
+        integration deliberately does not call the orders endpoint, because it
+        returns a bank account number and the ordering person's name.
