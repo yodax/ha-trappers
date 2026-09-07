@@ -19,6 +19,19 @@ CONF_PASSWORD = "password"
 # and inspectable, which is worth more here than the handful of lines it costs.
 POLL_HOURS = (8, 11, 14, 17, 20)
 
+# Each config entry polls at a fixed offset of its own after each slot, between
+# zero and this. Nothing here needs minute precision — points are credited once
+# a working day — and without it every install of this integration in the world
+# would hit an employer benefits provider's API at exactly 08:00:00. It also
+# keeps polls off the top of the hour, where every cron job and every other
+# integration already is.
+#
+# The offset is derived from the config entry rather than rolled fresh each
+# time, so it is stable for a given install: spreading load is a property
+# *across* installs, and re-rolling would buy none of it while giving up the
+# predictability that fixed slots exist for. See `poll_jitter()`.
+MAX_POLL_JITTER = timedelta(minutes=15)
+
 # Floor on the computed gap to the next slot. A clock step, a DST transition or
 # waking exactly on a slot boundary can compute a zero or negative delta, and an
 # unclamped value there is a hot loop against someone's employer's API.

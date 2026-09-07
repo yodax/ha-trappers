@@ -88,8 +88,14 @@ If the catalogue ever stops having one consistent rate, the sensor reads
 
 ## Polling
 
-Each account polls **five times a day — at 08:00, 11:00, 14:00, 17:00 and
-20:00** in your Home Assistant timezone. Nothing overnight.
+Each account polls **five times a day — shortly after 08:00, 11:00, 14:00,
+17:00 and 20:00** in your Home Assistant timezone. Nothing overnight.
+
+"Shortly after" is a fixed offset of up to 15 minutes that your installation
+picks once and then keeps, so yours might poll at 08:06, 11:06, 14:06 and so
+on, every day. That is so that every installation of this integration does not
+arrive at the API at exactly 08:00:00 — and it keeps polls off the top of the
+hour, where everything else in your system already is.
 
 Points are credited at most once per working day, when the collector unit
 reads your bike tag as you arrive at the office, so there is genuinely nothing
@@ -98,8 +104,9 @@ employer benefits provider, and polling it 48 times a day to catch one event
 would be rude.
 
 The slots are fixed wall-clock times rather than a free-running three-hour
-timer, so "when does it poll?" has an answer that does not depend on when you
-last restarted Home Assistant. Across the daylight-saving changes one gap is
+timer, and your offset is stable rather than re-rolled each time, so "when
+does it poll?" has an answer that does not depend on when you last restarted
+Home Assistant. Across the daylight-saving changes one gap is
 an hour shorter or longer in real time — the slots stay at 08:00 and 20:00
 local, which is the point.
 

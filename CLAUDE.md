@@ -314,8 +314,8 @@ calling.
 
 - **Domain is `trappers`.** Display name "Trappers" in `manifest.json`.
 - **`iot_class` is `cloud_polling`, `integration_type` is `service`.**
-- **Polls at fixed wall-clock slots — 08:00, 11:00, 14:00, 17:00, 20:00 local
-  — not on an interval** (0.1.x polled every 30 minutes). Points are credited
+- **Polls at fixed wall-clock slots — 08:00, 11:00, 14:00, 17:00, 20:00 local,
+  plus a stable per-entry offset of up to 15 minutes — not on an interval** (0.1.x polled every 30 minutes). Points are credited
   at most once per working day, when the collector unit reads the tag on
   arrival, so there is nothing to see overnight, and this is an unofficial API
   belonging to an employer benefits provider. Five polls × four requests is
@@ -422,6 +422,28 @@ doesn't dictate.
      a DST transition or waking exactly on a slot boundary can compute a zero
      or negative delta; unclamped, that is a hot loop against an employer
      benefits provider's API.
+
+  5. **The per-entry offset uses `hashlib`, never the builtin `hash()`.**
+     Python randomises string hashing per process, so `hash()` would re-roll
+     the offset on every HA restart while the code still read as
+     deterministic — the same species of bug as (1): correct-looking, and
+     invisible from a single run. `test_offset_is_stable_across_processes`
+     recomputes it in subprocesses under two different `PYTHONHASHSEED`s,
+     which is the only way to catch it; the `hash()` version passes every
+     other test in the file. Seeded from `entry.entry_id` (a random ULID)
+     rather than the email: it spreads a two-account household across two
+     offsets and keeps an address out of the calculation.
+
+     Added **after** the slot, never around it — a symmetric spread would let
+     the first poll of the day fire at 07:52, which is the one thing the
+     08:00 boundary exists to prevent.
+
+     Stable per install rather than re-rolled per poll, deliberately:
+     spreading load is a property *across* installs, so a fixed offset buys
+     all of the herd-avoidance while keeping the predictability that fixed
+     slots exist for. Its practical value today is nil — there is one install
+     — but this is on HACS, and the cost of adding it later, after people are
+     running it, is higher than the cost of having it now.
 
   Fixed slots rather than a free-running 3h timer because a timer is anchored
   to whenever HA last restarted, drifts to arbitrary times, and makes "when
