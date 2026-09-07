@@ -411,10 +411,19 @@ class TestReschedulingAfterFailure:
         coordinator.update_interval = MIN_UPDATE_INTERVAL
         coordinator.client.async_get_data.side_effect = TrappersApiError("boom")
 
-        for _ in range(3):
-            await coordinator.async_refresh()
-            assert coordinator.last_update_success is False
-            assert coordinator.update_interval > timedelta(minutes=5)
+        # Pinned mid-window, so the assertion cannot pass or fail by accident of
+        # what time the suite happens to run at.
+        with patch(
+            "custom_components.trappers.coordinator.dt_util.now",
+            return_value=local(2026, 9, 7, 12, 0),
+        ):
+            for _ in range(3):
+                await coordinator.async_refresh()
+                assert coordinator.last_update_success is False
+                assert coordinator.update_interval == interval_until_next_poll(
+                    local(2026, 9, 7, 12, 0),
+                    poll_jitter(coordinator.config_entry.entry_id),
+                )
 
     async def test_an_auth_failure_also_reschedules(self, hass: HomeAssistant) -> None:
         """ConfigEntryAuthFailed leaves the flow to HA, but must not pin the timer."""
@@ -422,10 +431,16 @@ class TestReschedulingAfterFailure:
         coordinator.client.async_get_data.side_effect = TrappersAuthError("bad password")
         coordinator.update_interval = MIN_UPDATE_INTERVAL
 
-        await coordinator.async_refresh()
+        with patch(
+            "custom_components.trappers.coordinator.dt_util.now",
+            return_value=local(2026, 9, 7, 12, 0),
+        ):
+            await coordinator.async_refresh()
         await hass.async_block_till_done()
 
-        assert coordinator.update_interval > timedelta(minutes=5)
+        assert coordinator.update_interval == interval_until_next_poll(
+            local(2026, 9, 7, 12, 0), poll_jitter(coordinator.config_entry.entry_id)
+        )
 
 
 async def test_schedule_is_measured_from_when_the_work_finished(
@@ -453,3 +468,38 @@ async def test_schedule_is_measured_from_when_the_work_finished(
     assert coordinator.last_update_success is True
     # The 14:00 slot, roughly three hours out — not a 60-second bonus poll.
     assert coordinator.update_interval > timedelta(hours=2)
+
+
+@pytest.mark.usefixtures("amsterdam_time_zone")
+class TestNoRedundantPollForTheSlotJustServed:
+    """A refresh finishing *before* the slot it was woken for must not re-poll.
+
+    HA's timer can fire fractionally early, and a fast refresh — or a fast
+    failure — can complete before the target instant. Measuring from completion
+    narrowed that window but did not close it: the arithmetic still re-selected
+    the slot being served, leaving a delta the clamp rounded up into a whole
+    extra poll a minute later.
+    """
+
+    @pytest.mark.parametrize(
+        "offset_seconds",
+        [-1, -30, -59, 0, 1],
+        ids=["1s-early", "30s-early", "59s-early", "on-the-dot", "1s-late"],
+    )
+    def test_a_slot_within_the_clamp_is_skipped(self, offset_seconds: int) -> None:
+        now = local(2026, 9, 7, 11) + timedelta(seconds=offset_seconds)
+
+        interval = interval_until_next_poll(now)
+
+        # The 14:00 slot, not a 60-second repeat of the 11:00 one.
+        assert interval > timedelta(hours=2)
+
+    def test_the_last_slot_of_the_day_rolls_to_tomorrow_not_to_itself(self) -> None:
+        now = local(2026, 9, 7, 20) - timedelta(seconds=1)
+
+        assert next_poll_time(now + MIN_UPDATE_INTERVAL) == local(2026, 9, 8, 8)
+
+    def test_a_normal_mid_window_gap_is_untouched(self) -> None:
+        assert interval_until_next_poll(local(2026, 9, 7, 10, 30)) == timedelta(
+            minutes=30
+        )

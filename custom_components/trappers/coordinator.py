@@ -90,7 +90,15 @@ def interval_until_next_poll(
     subtraction reports. Converting to UTC first resolves each offset and hands
     the problem to the tz database, which is where it belongs.
     """
-    delta = dt_util.as_utc(next_poll_time(now, jitter)) - dt_util.as_utc(now)
+    # Look for the next poll from `now + MIN_UPDATE_INTERVAL`, not from `now`.
+    # HA's timer can fire fractionally early, and a fast refresh can finish
+    # before the slot it was woken for; the arithmetic would then re-select that
+    # same slot, leaving a delta of a second or two that the clamp rounded up
+    # into a whole extra poll a minute later. Skipping any slot less than a
+    # clamp away means the slot just served cannot be served twice — its data is
+    # already fresh.
+    target = next_poll_time(now + MIN_UPDATE_INTERVAL, jitter)
+    delta = dt_util.as_utc(target) - dt_util.as_utc(now)
     return max(delta, MIN_UPDATE_INTERVAL)
 
 
@@ -125,11 +133,13 @@ class TrappersCoordinator(DataUpdateCoordinator[dict]):
     for the next slot, which is the right behaviour anyway: points change once
     a working day, so there is nothing worth retrying hard for.
 
-    Measuring from completion rather than from the start of the update also
-    fixes an off-by-a-poll. HA's timer may fire slightly early; the slot
-    arithmetic would then still select the slot being served, leaving a delta
-    of a second or two that the clamp rounded up to a whole extra poll a minute
-    later. By the time the request has finished, that ambiguity is gone.
+    Measuring from completion rather than from the start of the update narrows
+    an off-by-a-poll but does not close it, which is why
+    `interval_until_next_poll()` additionally refuses to select a slot less than
+    one clamp away. HA's timer may fire slightly early, and a fast refresh — or
+    a fast *failure* — can finish before the slot it was woken for; without that
+    second guard the arithmetic re-selects the slot just served and schedules a
+    redundant poll a minute later.
     """
 
     def __init__(

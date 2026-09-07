@@ -72,6 +72,7 @@ import math
 import re
 from collections import Counter
 from datetime import date, datetime, timedelta
+from collections.abc import Callable
 from typing import Any
 
 import aiohttp
@@ -124,7 +125,12 @@ MAX_ARTICLE_PAGES = 10
 # A gift card's face value, as it appears in the article name: "bol. cadeaukaart
 # € 25", "VVV Cadeaukaart € 100". Dutch number formatting, so "1.000,00" is a
 # thousand euros, not one.
-FACE_VALUE_RE = re.compile(r"€\s*(\d[\d.,\s\u00a0]*)")
+# A *bounded* amount: optional grouped thousands, optional two-decimal tail,
+# and nothing numeric immediately after. An earlier, greedier pattern let
+# "€ 25,00 2026 editie" parse as 25.002026 by swallowing the year.
+FACE_VALUE_RE = re.compile(
+    r"€\s*(\d{1,3}(?:[.\s\u00a0]\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?)(?![\d.,])"
+)
 
 # Guards on deriving a single rate from the catalogue. The probed account gave
 # 59 priced articles at *exactly* one rate, so these thresholds are nowhere near
@@ -133,7 +139,9 @@ FACE_VALUE_RE = re.compile(r"€\s*(\d[\d.,\s\u00a0]*)")
 # catalogue with two rates means the single-rate model is wrong, and that is
 # worth surfacing as an unknown rather than papering over.
 MIN_PRICED_ARTICLES = 5
-# A *clear* plurality, and strictly greater. At 0.6-inclusive a 6-vs-4 split
+# A *clear* plurality: the mode must beat this share, not merely match it —
+# at a non-strict 0.6 a 6-vs-4 split passed, and at a non-strict 0.8 a 4-vs-1
+# split did. At 0.6-inclusive a 6-vs-4 split
 # still produced a confident rate, which flatly contradicted the promise that a
 # catalogue without one consistent rate reads `unknown`. The probed catalogue is
 # 100% uniform, so a real one is nowhere near this bound; anything that is means
@@ -171,11 +179,14 @@ def _is_number(value: Any) -> bool:
     can carry `Infinity`/`NaN`, which reach a sensor state as "inf"/"nan" or
     raise `OverflowError` on conversion rather than being caught here.
     """
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        # An int too large to convert to float raises here rather than
+        # answering — and would go on to raise from any arithmetic downstream.
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _parse_date(raw: Any) -> date | None:
@@ -316,25 +327,45 @@ class TrappersApiClient:
         return items, total
 
     async def _async_fetch_all(
-        self, method: str, url: str, what: str, *, page_limit: int, max_pages: int
+        self,
+        method: str,
+        url: str,
+        what: str,
+        *,
+        page_limit: int,
+        max_pages: int,
+        stop_when: "Callable[[list[Any]], bool] | None" = None,
     ) -> list[Any]:
-        """Page through a list endpoint until every item has been collected.
+        """Page through a list endpoint. The only paging loop in this client.
 
-        Two things here are deliberate, and both were bugs first:
+        There used to be a second, hand-rolled one for transactions, and it kept
+        both of the bugs this one had already been fixed for — which is the
+        argument for there being exactly one.
 
-        The offset advances by **how many items have actually been collected**,
-        not by `page * page_limit`. A server that caps its page size below the
-        requested limit would otherwise make this skip every record between the
-        short page's end and the next requested offset — silently, since the
-        response still looks well-formed.
+        Three things are deliberate:
 
-        An **empty page while `total` says there is more is an error**, not a
-        stopping condition. Treating it as "done" meant a server answering
-        `{"items": [], "total": 100}` produced a confident `cycling_days_total`
-        of zero: a plausible number, wrong, and indistinguishable on a
-        dashboard from a genuinely new account.
+        The offset advances by **items actually collected**, not by
+        `page * page_limit`, so a server capping its page size below the
+        requested limit cannot make this skip every record in between.
+
+        An **empty page while `total` promises more is an error**, not a
+        stopping condition. Treating it as "done" made
+        `{"items": [], "total": 100}` produce a confident zero.
+
+        **Records already seen are dropped, and a page of nothing but repeats
+        is an error.** Advancing the offset does not help against a server that
+        ignores offsets: two identical pages used to double-count, turning one
+        10-point transaction into 20. Trappers' own duplicate tag reads are
+        *not* affected — those are distinct records with distinct ids on the
+        same date, which is exactly why the check is on `id` and not on content.
+
+        `stop_when` lets a caller end paging early once it has enough (the
+        transactions sum only needs back to the start of the month). It is
+        called with the newly seen records of each page.
         """
         collected: list[Any] = []
+        seen_ids: set[Any] = set()
+
         for _page in range(max_pages):
             payload = await self._async_request(
                 method, url, params={"limit": page_limit, "offset": len(collected)}
@@ -348,7 +379,25 @@ class TrappersApiClient:
                     f"Unexpected {what} response: an empty page while {total} "
                     f"item(s) were promised and {len(collected)} collected"
                 )
-            collected.extend(items)
+
+            fresh: list[Any] = []
+            for item in items:
+                item_id = item.get("id") if isinstance(item, dict) else None
+                if item_id is not None:
+                    if item_id in seen_ids:
+                        continue
+                    seen_ids.add(item_id)
+                fresh.append(item)
+
+            if not fresh:
+                raise TrappersApiError(
+                    f"Unexpected {what} response: a page containing only records "
+                    "already returned — the endpoint appears to be ignoring 'offset'"
+                )
+
+            collected.extend(fresh)
+            if stop_when is not None and stop_when(fresh):
+                return collected
             if len(collected) >= total:
                 return collected
 
@@ -411,63 +460,65 @@ class TrappersApiClient:
         Only positive amounts count. Spending points in the webshop produces an
         ``EXPENSE_ORDER`` row with a negative amount; including those would make
         this "net points movement", which is not what the sensor claims.
+
+        Transactions come back newest first, so paging stops as soon as a page
+        reaches into last month — via the shared paging helper's `stop_when`,
+        rather than the separate loop this used to have, which quietly kept the
+        empty-page and offset bugs after the shared one was fixed.
         """
         month_start = _month_start(today)
-        total_earned = 0.0
-        collected = 0
 
-        for page in range(MAX_TRANSACTION_PAGES):
-            payload = await self._async_request(
-                "GET",
-                TRANSACTIONS_URL,
-                params={
-                    "limit": TRANSACTIONS_PAGE_LIMIT,
-                    "offset": page * TRANSACTIONS_PAGE_LIMIT,
-                },
+        def _reached_last_month(items: list[Any]) -> bool:
+            return any(
+                stamp is not None and stamp < month_start
+                for stamp in (self._transaction_date(item) for item in items)
             )
-            items, total = self._validate_page(payload, "transactions")
-            collected += len(items)
 
-            reached_last_month = False
-            for item in items:
-                if not isinstance(item, dict):
-                    raise TrappersApiError(
-                        "Unexpected transactions response: item is not an object"
-                    )
-                raw_date = item.get("date")
-                stamp = None
-                if isinstance(raw_date, str):
-                    try:
-                        # "YYYY-MM-DDTHH:MM:SS" here, not the plain date on events.
-                        stamp = datetime.fromisoformat(raw_date).date()
-                    except ValueError:
-                        stamp = None
-                if stamp is None:
-                    # No value interpolation — see the note on events above.
-                    raise TrappersApiError(
-                        "Unexpected transactions response: item has no usable 'date'"
-                    )
-
-                if stamp < month_start:
-                    # Newest first, so everything from here on is older still.
-                    reached_last_month = True
-                    break
-
-                amount = item.get("amount")
-                if not _is_number(amount):
-                    raise TrappersApiError(
-                        "Unexpected transactions response: item has no finite "
-                        "numeric 'amount'"
-                    )
-                if amount > 0:
-                    total_earned += float(amount)
-
-            if reached_last_month or not items or collected >= total:
-                return total_earned
-
-        raise TrappersApiError(
-            f"Gave up paging transactions after {MAX_TRANSACTION_PAGES} pages"
+        items = await self._async_fetch_all(
+            "GET",
+            TRANSACTIONS_URL,
+            "transactions",
+            page_limit=TRANSACTIONS_PAGE_LIMIT,
+            max_pages=MAX_TRANSACTION_PAGES,
+            stop_when=_reached_last_month,
         )
+
+        total_earned = 0.0
+        for item in items:
+            stamp = self._transaction_date(item)
+            if stamp is None:
+                # No value interpolation — the offending text is server-supplied
+                # and this message reaches the log.
+                raise TrappersApiError(
+                    "Unexpected transactions response: item has no usable 'date'"
+                )
+            if stamp < month_start:
+                continue
+            amount = item.get("amount")
+            if not _is_number(amount):
+                raise TrappersApiError(
+                    "Unexpected transactions response: item has no finite "
+                    "numeric 'amount'"
+                )
+            if amount > 0:
+                total_earned += float(amount)
+        return total_earned
+
+    @staticmethod
+    def _transaction_date(item: Any) -> date | None:
+        """Date of a transaction row, or None if it has no usable one."""
+        if not isinstance(item, dict):
+            raise TrappersApiError(
+                "Unexpected transactions response: item is not an object"
+            )
+        raw = item.get("date")
+        if not isinstance(raw, str):
+            return None
+        try:
+            # "YYYY-MM-DDTHH:MM:SS" here, not the plain date on events.
+            return datetime.fromisoformat(raw).date()
+        except ValueError:
+            return None
 
     async def _async_get_commute_distance_m(self, today: date) -> int | None:
         """The commute registered for *today*, in metres, or None if there is none.
@@ -552,22 +603,23 @@ class TrappersApiClient:
         if len(matches) != 1:
             return None
 
-        raw = matches[0].strip(".,\u00a0 ")
-        if "," in raw:
-            # Dutch decimal comma: "1.000,00" is a thousand euros.
-            raw = raw.replace(".", "").replace(" ", "").replace("\u00a0", "")
-            raw = raw.replace(",", ".")
-        else:
-            groups = re.split(r"[.\s\u00a0]", raw)
-            if len(groups) > 1 and all(len(g) == 3 for g in groups[1:]):
-                # "1.000" / "1 000" with no comma is a thousands separator.
-                raw = "".join(groups)
-            elif len(groups) > 1:
-                # Neither a clean decimal nor a clean thousands grouping.
-                return None
+        raw = matches[0].strip()
+        whole, _, decimals = raw.partition(",")
+
+        # Whatever separators remain must be a clean thousands grouping:
+        # "1.000", "1 000". "1.00" is neither a grouping nor a decimal here, so
+        # it is refused rather than silently read as 100.
+        groups = re.split(r"[.\s\u00a0]", whole)
+        if len(groups) > 1 and not (
+            1 <= len(groups[0]) <= 3 and all(len(g) == 3 for g in groups[1:])
+        ):
+            return None
+        digits = "".join(groups)
+        if not digits.isdigit():
+            return None
 
         try:
-            value = float(raw)
+            value = float(f"{digits}.{decimals}" if decimals else digits)
         except ValueError:
             return None
         return value if value > 0 and math.isfinite(value) else None
@@ -600,10 +652,20 @@ class TrappersApiClient:
             # catalogue, so this path is untested against real expiry data —
             # which is the reason to honour the field rather than assume it
             # stays null.
-            available_from = _parse_date(item.get("availableFrom"))
+            # A present-but-unparseable date must disqualify the article, not
+            # be read as "no limit". Silently promoting an unreadable
+            # `availableUntil` to unlimited let expired articles set the rate.
+            raw_from = item.get("availableFrom")
+            available_from = _parse_date(raw_from)
+            if raw_from is not None and available_from is None:
+                continue
             if available_from is not None and available_from > today:
                 continue
-            available_until = _parse_date(item.get("availableUntil"))
+
+            raw_until = item.get("availableUntil")
+            available_until = _parse_date(raw_until)
+            if raw_until is not None and available_until is None:
+                continue
             if available_until is not None and available_until < today:
                 continue
 
@@ -626,7 +688,7 @@ class TrappersApiClient:
         if len(rates) < MIN_PRICED_ARTICLES:
             return None
         rate, count = Counter(rates).most_common(1)[0]
-        if count / len(rates) < MIN_MODE_SHARE:
+        if count / len(rates) <= MIN_MODE_SHARE:
             _LOGGER.debug(
                 "Catalogue rate is not uniform (%s of %s articles at the mode) — "
                 "reporting the balance's euro value as unknown",
@@ -663,10 +725,15 @@ class TrappersApiClient:
         105 is this employer's contract term, exactly as 0.01 was, and is never
         hardcoded.
         """
+        # Also expires at a day boundary, not only after 24 hours: article
+        # availability is expressed in whole dates, so a rate qualified by
+        # articles that lapse at midnight must not be reused the next morning
+        # on the strength of being under a day old.
         if (
             self._points_per_euro is not None
             and self._points_per_euro_fetched is not None
             and now - self._points_per_euro_fetched < POINTS_PER_EURO_MAX_AGE
+            and self._points_per_euro_fetched.date() == now.date()
         ):
             return self._points_per_euro
 
@@ -702,7 +769,13 @@ class TrappersApiClient:
         now = now or datetime.now()
 
         try:
-            data: dict[str, Any] = {"balance": await self.async_get_balance()}
+            # Stamped into the payload so the sensors report the month these
+            # figures were computed for, not the month it happens to be when
+            # someone reads them. A poll that starts at 23:59:59 on the 31st
+            # computes that month's counts; publishing tomorrow's date as their
+            # reset point would file them under the wrong month.
+            data: dict[str, Any] = {"month_start": _month_start(today)}
+            data["balance"] = await self.async_get_balance()
             data.update(await self._async_get_cycling_days(today))
             data["points_earned_this_month"] = (
                 await self._async_get_points_earned_this_month(today)

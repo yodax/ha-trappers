@@ -20,7 +20,8 @@ REPO_ROOT=$(git rev-parse --show-toplevel) || exit 1
 HOOK="$REPO_ROOT/.githooks/pre-commit"
 [ -x "$HOOK" ] || { echo "FAIL: $HOOK is not executable"; exit 1; }
 
-WORK=$(mktemp -d)
+WORK=$(mktemp -d) || { echo "FAIL: could not create a scratch directory"; exit 1; }
+[ -d "$WORK" ] || { echo "FAIL: scratch directory missing"; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
 
 pass=0
@@ -35,7 +36,10 @@ case_n=0
 fresh_repo() {
   case_n=$((case_n + 1))
   SCRATCH="$WORK/case$case_n"
-  git init -q -b main "$SCRATCH"
+  git init -q -b main "$SCRATCH" || {
+    echo "FAIL: could not create scratch repo (harness broken, not a hook verdict)"
+    exit 1
+  }
   git -C "$SCRATCH" config user.name "test"
   git -C "$SCRATCH" config user.email "test@example.com"
   git -C "$SCRATCH" config core.hooksPath "$REPO_ROOT/.githooks"
@@ -85,7 +89,12 @@ msg_should_block() {
   _commit_msg "$2" || rc=$?
   case "$rc" in
     0) echo "FAIL: commit-msg did NOT block: $1"; fail=$((fail + 1)) ;;
-    1) echo "ok:   blocked $1"; pass=$((pass + 1)) ;;
+    1) if printf '%s' "$LAST_OUT" | grep -qF "$BLOCK_MARKER"; then
+         echo "ok:   blocked $1"; pass=$((pass + 1))
+       else
+         echo "FAIL: commit failed but not via the leak check: $1"
+         printf '%s\n' "$LAST_OUT" | sed 's/^/    /'; fail=$((fail + 1))
+       fi ;;
     *) echo "FAIL: harness error on: $1"; fail=$((fail + 1)) ;;
   esac
 }
@@ -101,12 +110,23 @@ msg_should_pass() {
   esac
 }
 
+# A commit can fail for reasons that have nothing to do with the hook — a broken
+# scratch repo, a missing mktemp, a git that would not run. Counting any failure
+# as "blocked" is the same fail-open the hook itself once had, one level up. So a
+# block only counts if the scanner said so in its own words.
+BLOCK_MARKER="leak check:"
+
 should_block() {
   local rc=0
   _commit "$2" || rc=$?
   case "$rc" in
     0) echo "FAIL: hook did NOT block: $1"; fail=$((fail + 1)) ;;
-    1) echo "ok:   blocked $1"; pass=$((pass + 1)) ;;
+    1) if printf '%s' "$LAST_OUT" | grep -qF "$BLOCK_MARKER"; then
+         echo "ok:   blocked $1"; pass=$((pass + 1))
+       else
+         echo "FAIL: commit failed but not via the leak check: $1"
+         printf '%s\n' "$LAST_OUT" | sed 's/^/    /'; fail=$((fail + 1))
+       fi ;;
     *) echo "FAIL: harness error on: $1"; fail=$((fail + 1)) ;;
   esac
 }
@@ -211,6 +231,19 @@ msg_should_block "a homelab path in the message" 'copied into /tank/docker/homea
 msg_should_block "an IBAN in the message" 'removed NL91ABNA0417164300 from the fixture'
 TRAPPERS_LEAK_PATTERNS="$CANARY_FILE2" \
   msg_should_block "an identity canary in the message" 'redacted ZZQQ-CANARY-1234 from README'
+
+echo "── a '#' line in a commit message is still published ──"
+# git commit -m and -F use cleanup=whitespace, which does NOT strip comments.
+msg_should_block "a commented-out LAN address in the message" '# staged on 192.168.8.60'
+TRAPPERS_LEAK_PATTERNS="$CANARY_FILE2" \
+  msg_should_block "a commented-out identity canary" '# ZZQQ-CANARY-1234'
+
+echo "── a non-ASCII filename must still be scanned ──"
+# With core.quotePath on, --name-only renders "café.txt" C-escaped; feeding that
+# back as a pathspec matches nothing and yields an empty, unscanned diff.
+PROBE_PATH='café.txt' should_block "LAN address in a non-ASCII filename" \
+  'the box lives at 192.168.8.60'
+unset PROBE_PATH
 
 echo "pre-commit leak-guard: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

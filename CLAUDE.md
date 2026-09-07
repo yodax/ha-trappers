@@ -527,7 +527,48 @@ doesn't dictate.
   matching what recent Home Assistant requires. The system Python 3.11 cannot
   install `pytest-homeassistant-custom-component`.
 
-## What a second reviewer caught (0.2.2)
+## What a second reviewer caught (0.2.2, then 0.2.3)
+
+The review was run twice. The second pass, on the fixes themselves, found that
+several were partial — which is the more useful half of the exercise and worth
+recording as its own lesson: *a fix is not done because the finding it answers
+is gone.*
+
+Missed on the first pass, fixed in 0.2.3:
+
+- **Transactions had their own paging loop.** The shared one was fixed; this
+  one, a few hundred lines away, kept both the empty-page and the offset bug.
+  There is now exactly one paging implementation, with an optional `stop_when`
+  for the early exit transactions needs. Duplication was the whole cause.
+- **Advancing the offset does not defend against a server that ignores it.**
+  Two identical pages turned one 10-point transaction into 20. Records are now
+  deduplicated by `id`, and a page of nothing but repeats is an error — keyed
+  on `id` and not on content precisely so Trappers' own duplicate tag reads,
+  which are distinct rows on the same date, still page normally.
+- **Completion-time scheduling narrowed the early-fire window without closing
+  it.** A fast refresh can still finish before its slot. The next poll is now
+  sought from `now + MIN_UPDATE_INTERVAL`, so the slot just served cannot be
+  served twice.
+- **`last_reset` read the clock instead of the data.** A poll starting at
+  23:59:59 on the 31st computes that month's counts and can finish a second
+  into the next month; the sensor would then file those counts under the new
+  month. The month is now stamped into the coordinator's payload.
+- **`MIN_MODE_SHARE` was still not strict** (`<`, so exactly 0.8 passed), an
+  unparseable `availableUntil` was read as "no limit" rather than
+  disqualifying, and the face-value regex swallowed a trailing year
+  ("€ 25,00 2026 editie" → 25.002026).
+- **The commit-msg hook skipped `#` lines**, on the assumption git strips them
+  — but `git commit -m`/`-F` use `cleanup=whitespace`, which does not. The very
+  hook written to close a commit-message hole had a commit-message hole.
+- **`git diff --name-only` renders non-ASCII paths C-escaped**, and feeding
+  that back as a pathspec matches nothing, so such a file was committed
+  unscanned. Now `-z`.
+- **The hook harness counted any failed commit as a block**, so a broken
+  scratch environment would have reported passes without ever reaching the
+  hook — the same fail-open as the original bug, one level up. A block now has
+  to carry the scanner's own marker.
+
+Original findings (0.2.2)
 
 0.2.1 was reviewed adversarially by a second model after I had declared it
 ready. It found real bugs in code I had just finished writing tests for, which

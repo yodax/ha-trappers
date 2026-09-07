@@ -98,8 +98,9 @@ euro of their supplier price. So this sensor reports the best achievable value
 of your balance. Please don't "fix" it by averaging the physical goods in —
 that would understate what the balance is worth.
 
-If the catalogue ever stops having one consistent rate, the sensor reads
-`unknown` rather than reporting an average that would buy nothing.
+If the catalogue ever stops having a clearly dominant rate — or if an article's
+availability dates cannot be read — the sensor reads `unknown` rather than
+reporting an average that would buy nothing.
 
 ## Polling
 

@@ -15,6 +15,7 @@ none of that belongs in a public repo. See CLAUDE.md's Privacy section.
 """
 from __future__ import annotations
 
+import itertools
 from datetime import date, datetime, timedelta
 
 import aiohttp
@@ -109,9 +110,15 @@ def page(items: list, total: int | None = None, limit: int = 500) -> FakeRespons
     )
 
 
+# Real records carry distinct ids — including Trappers' own duplicate tag
+# reads, which are separate rows on the same date. Reusing one id across
+# fixtures would look to the client exactly like a server replaying a page.
+_ids = itertools.count(1)
+
+
 def event(day: str, status: str = "PROCESSED") -> dict:
     return {
-        "id": 1,
+        "id": next(_ids),
         "date": day,
         "tag": 1,
         "collectorUnit": 1,
@@ -122,7 +129,7 @@ def event(day: str, status: str = "PROCESSED") -> dict:
 
 def transaction(stamp: str, amount: float, tx_type: str = "INCOME_DISTANCE") -> dict:
     return {
-        "id": 1,
+        "id": next(_ids),
         "employee": 1,
         "date": stamp,
         "amount": amount,
@@ -147,23 +154,27 @@ DEFAULT_TRANSACTIONS = [
     transaction("2026-08-26T07:14:28", 154.0),
 ]
 
-DEFAULT_COMMUTE = [
-    {
-        "id": 1,
+def commute(**overrides: object) -> dict:
+    """A commute registration. Fresh id each time, as the real ones have."""
+    return {
+        "id": next(_ids),
         "employee": 1,
         "location": 1,
         "locationAddress": {},
         "startDate": "2025-03-04",
         "endDate": None,
         "distance": 11000,
+        **overrides,
     }
-]
+
+
+DEFAULT_COMMUTE = [commute()]
 
 def gift_card(face: str, price: object, **overrides: object) -> dict:
     """A catalogue article whose face value is in its name, as gift cards are."""
     numeric = price if isinstance(price, (int, float)) else 0.0
     return {
-        "id": 1,
+        "id": next(_ids),
         "articleName": f"bol. cadeaukaart {face}",
         "trappersPrice": price,
         # purchasePrice is trappersPrice x 0.01 by construction on the live API —
@@ -179,7 +190,7 @@ def gift_card(face: str, price: object, **overrides: object) -> dict:
 def physical_good(name: str, price: float, **overrides: object) -> dict:
     """A catalogue article with no face value in its name — a laptop, a watch."""
     return {
-        "id": 2,
+        "id": next(_ids),
         "articleName": name,
         "trappersPrice": price,
         "purchasePrice": {"currency": "EUR", "amount": price * 0.01},
@@ -310,6 +321,7 @@ class TestAsyncGetData:
         data = await client.async_get_data(today=TODAY, now=NOW)
 
         assert data == {
+            "month_start": date(2026, 9, 1),
             "balance": 10000.0,
             # 5 event rows, one of which is a duplicate tag read → 4 days.
             "cycling_days_total": 4,
@@ -367,10 +379,14 @@ class TestAsyncGetData:
         assert event_calls[1][2]["params"]["offset"] == 3
 
     async def test_runaway_event_paging_raises_rather_than_looping(self) -> None:
-        """A `total` that never gets reached must stop, not spin forever."""
-        client, _session = make_client(
-            responses(**{EVENTS_URL: [page([event("2026-09-01")], total=10**6)]})
-        )
+        """A `total` that never gets reached must stop, not spin forever.
+
+        Every page here carries genuinely new records, so this is the real
+        runaway case rather than the repeated-page one — the cap is the only
+        thing that ends it.
+        """
+        pages = [page([event(f"2026-09-{n % 28 + 1:02d}")], total=10**6) for n in range(40)]
+        client, _session = make_client(responses(**{EVENTS_URL: pages}))
 
         with pytest.raises(TrappersApiError, match="Gave up paging events"):
             await client.async_get_data(today=TODAY, now=NOW)
@@ -432,8 +448,8 @@ class TestAsyncGetData:
         assert data["commute_distance"] == 11.0
 
     async def test_newest_commute_registration_wins(self) -> None:
-        older = {**DEFAULT_COMMUTE[0], "startDate": "2024-01-01", "distance": 4000}
-        newer = {**DEFAULT_COMMUTE[0], "startDate": "2026-01-01", "distance": 8500}
+        older = commute(startDate="2024-01-01", distance=4000)
+        newer = commute(startDate="2026-01-01", distance=8500)
         client, _session = make_client(
             responses(**{COMMUTE_URL: [page([older, newer], limit=100)]})
         )
@@ -772,7 +788,7 @@ class TestMalformedResponses:
                     COMMUTE_URL: [
                         FakeResponse(
                             json_data={
-                                "items": [{"startDate": "2025-03-04", "distance": None}],
+                                "items": [commute(distance=None)],
                                 "total": 1,
                                 "offset": 0,
                             }
@@ -823,8 +839,11 @@ class TestFaceValueParsing:
             pytest.param("Cadeaukaart € 12,50", 12.5, id="decimal-comma"),
             pytest.param("Cadeaukaart € 1.000,00", 1000.0, id="dutch-thousands"),
             pytest.param("Cadeaukaart € 1.000", 1000.0, id="thousands-no-decimals"),
-            pytest.param("Cadeaukaart € 25.", 25.0, id="trailing-punctuation"),
+
             pytest.param("Cadeaukaart t.w.v. € 75 (digitaal)", 75.0, id="mid-name"),
+            # The amount ends at ",00"; the year that follows is prose, and an
+            # earlier greedier pattern swallowed it into 25.002026.
+            pytest.param("Cadeaukaart € 25,00 2026 editie", 25.0, id="year-after-amount"),
         ],
     )
     def test_face_values_parsed(self, name: str, expected: float) -> None:
@@ -837,6 +856,7 @@ class TestFaceValueParsing:
             pytest.param("JBL Flip 7 - Zwart", id="no-currency"),
             pytest.param("Cadeaukaart € 0", id="zero"),
             pytest.param("Cadeaukaart € ..", id="unparseable"),
+            pytest.param("Cadeaukaart € 25.", id="trailing-separator"),
             pytest.param("", id="empty"),
             pytest.param(None, id="not-a-string"),
             pytest.param(12345, id="a-number"),
@@ -961,7 +981,7 @@ class TestRateQualification:
 
 class TestCommuteValidity:
     def _commute(self, **kw) -> dict:
-        return {**DEFAULT_COMMUTE[0], **kw}
+        return commute(**kw)
 
     async def test_a_future_registration_does_not_override_the_current_one(self) -> None:
         """Picking simply the newest startDate reported a commute not yet in force."""
@@ -1042,7 +1062,7 @@ class TestNumericValidation:
                 **{
                     COMMUTE_URL: [
                         page(
-                            [{**DEFAULT_COMMUTE[0], "distance": float("inf")}],
+                            [commute(distance=float("inf"))],
                             limit=100,
                         )
                     ]
@@ -1090,3 +1110,143 @@ class TestErrorsDoNotEchoResponseContent:
             await client.async_get_data(today=TODAY, now=NOW)
 
         assert self.CANARY not in str(excinfo.value)
+
+
+class TestPagingIsSharedNotDuplicated:
+    """Transactions once had their own paging loop, and it kept both bugs the
+    shared one had already been fixed for. These pin the shared behaviour on the
+    endpoint that used to diverge."""
+
+    async def test_empty_transaction_page_with_records_remaining_is_an_error(self) -> None:
+        client, _session = make_client(
+            responses(
+                **{
+                    TRANSACTIONS_URL: [
+                        FakeResponse(
+                            json_data={"limit": 100, "total": 100, "offset": 0, "items": []}
+                        )
+                    ]
+                }
+            )
+        )
+
+        with pytest.raises(TrappersApiError, match="empty page"):
+            await client.async_get_data(today=TODAY, now=NOW)
+
+    async def test_a_server_ignoring_offset_does_not_double_count_points(self) -> None:
+        """Two identical pages turned one 10-point transaction into 20."""
+        repeated = transaction("2026-09-05T10:00:00", 10.0)
+        client, _session = make_client(
+            responses(
+                **{
+                    TRANSACTIONS_URL: [
+                        page([repeated], total=2, limit=100),
+                        page([repeated], total=2, limit=100),
+                    ]
+                }
+            )
+        )
+
+        with pytest.raises(TrappersApiError, match="ignoring 'offset'"):
+            await client.async_get_data(today=TODAY, now=NOW)
+
+    async def test_a_server_ignoring_offset_does_not_truncate_events(self) -> None:
+        repeated = event("2026-09-01")
+        client, _session = make_client(
+            responses(
+                **{
+                    EVENTS_URL: [
+                        page([repeated], total=2),
+                        page([repeated], total=2),
+                    ]
+                }
+            )
+        )
+
+        with pytest.raises(TrappersApiError, match="ignoring 'offset'"):
+            await client.async_get_data(today=TODAY, now=NOW)
+
+    async def test_genuine_duplicate_tag_reads_are_not_mistaken_for_repeats(self) -> None:
+        """Trappers' own duplicates are distinct rows on the same date.
+
+        The repeat check is on `id` precisely so that a real duplicate tag read
+        — same date, different id — still pages normally.
+        """
+        first = [
+            event("2026-09-01"),
+            event("2026-09-01", status="PROCESSED_DUPLICATE"),
+        ]
+        second = [
+            event("2026-08-31"),
+            event("2026-08-31", status="PROCESSED_DUPLICATE"),
+        ]
+        client, session = make_client(
+            responses(**{EVENTS_URL: [page(first, total=4), page(second, total=4)]})
+        )
+
+        data = await client.async_get_data(today=TODAY, now=NOW)
+
+        # Four rows, two of them Trappers' own duplicate reads: two days, and
+        # crucially no "ignoring 'offset'" error along the way.
+        assert data["cycling_days_total"] == 2
+        assert len([c for c in session.calls if c[1] == EVENTS_URL]) == 2
+
+    async def test_transaction_pages_advance_by_records_collected(self) -> None:
+        first = [transaction("2026-09-01T10:00:00", 10.0) for _ in range(100)]
+        second = [transaction("2026-08-30T10:00:00", 99.0)]
+        client, session = make_client(
+            responses(
+                **{
+                    TRANSACTIONS_URL: [
+                        page(first, total=101, limit=100),
+                        page(second, total=101, limit=100),
+                    ]
+                }
+            )
+        )
+
+        data = await client.async_get_data(today=TODAY, now=NOW)
+
+        assert data["points_earned_this_month"] == 1000.0
+        offsets = [
+            c[2]["params"]["offset"] for c in session.calls if c[1] == TRANSACTIONS_URL
+        ]
+        assert offsets == [0, 100]
+
+
+class TestRateCacheFreshness:
+    async def test_the_rate_is_requalified_after_a_day_boundary(self) -> None:
+        """Availability is in whole dates, so a rate must not cross midnight.
+
+        A rate qualified in the evening by articles that lapse at midnight was
+        being reused next morning purely for being under 24 hours old.
+        """
+        client, session = make_client()
+        evening = datetime(2026, 9, 7, 23, 30)
+
+        await client.async_get_data(today=date(2026, 9, 7), now=evening)
+        await client.async_get_data(
+            today=date(2026, 9, 8), now=evening + timedelta(hours=1)
+        )
+
+        assert len([c for c in session.calls if c[1] == ARTICLES_URL]) == 2
+
+
+class TestAvailabilityDatesMustBeReadable:
+    async def test_an_unparseable_available_until_disqualifies_the_article(self) -> None:
+        """It used to be read as "no limit", so expired articles set the rate."""
+        articles = [
+            gift_card(f"€ {n}", n * 105.0, availableUntil="2000-01-01T00:00:00")
+            for n in (10, 20, 25, 50, 100)
+        ]
+
+        assert TrappersApiClient._derive_points_per_euro(articles, TODAY) is None
+
+    async def test_the_mode_threshold_is_strict(self) -> None:
+        """Four at one rate and one at another is exactly 0.8 — not a clear win."""
+        articles = [
+            *[gift_card(f"€ {n}", n * 105.0) for n in (10, 20, 25, 50)],
+            gift_card("€ 5", 500.0),
+        ]
+
+        assert TrappersApiClient._derive_points_per_euro(articles, TODAY) is None

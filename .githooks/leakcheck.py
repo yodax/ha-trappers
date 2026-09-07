@@ -145,11 +145,16 @@ def added_lines_from_staged_diff() -> list[tuple[str, str]]:
     header before the first `@@` hunk marker of a file; after it, every `+` line
     is content.
     """
+    # -z: NUL-delimited and unquoted. With the default `core.quotePath`, plain
+    # --name-only renders "café.txt" as the literal C-escaped string
+    # "caf\303\251.txt"; feeding that back as a pathspec matches no file, and an
+    # unmatched pathspec yields an empty diff rather than an error — so the file
+    # would be committed unscanned.
     staged = [
         f
         for f in run(
-            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"]
-        ).splitlines()
+            ["git", "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"]
+        ).split("\0")
         if f
     ]
     if not staged:
@@ -241,12 +246,12 @@ def main(argv: list[str]) -> int:
     if mode == "commit-msg":
         message_file = argv[2]
         with open(message_file, encoding="utf-8", errors="replace") as fh:
-            # Ignore git's own comment lines — they are stripped from the commit.
-            entries = [
-                ("commit message", line.rstrip("\n"))
-                for line in fh
-                if not line.startswith("#")
-            ]
+            # EVERY line, '#' ones included. An earlier version skipped them on
+            # the assumption that git strips comments — but `git commit -m` and
+            # `-F` use `cleanup=whitespace` by default, which does not, so
+            # `# ZZQQ-CANARY-4711` sailed straight through the gate and into the
+            # published message. What gets committed is what gets scanned.
+            entries = [("commit message", line.rstrip("\n")) for line in fh]
         # No path, so no .githooks/ exemption applies: a commit message has no
         # legitimate reason to contain a sample LAN address.
         failed = scan(entries, private, apply_generic_exemption=False)

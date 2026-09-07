@@ -120,23 +120,31 @@ class TrappersSensor(CoordinatorEntity[TrappersCoordinator], SensorEntity):
 
     @property
     def last_reset(self):
-        """Start of the current month, for the two calendar-month sensors.
+        """Start of the month **these figures were computed for**.
 
-        These count within a calendar month and drop back to zero on the 1st.
-        `TOTAL_INCREASING` looks like the natural fit and is a trap here: it
-        *infers* a reset from a decrease it actually observes, and this
-        integration deliberately does not poll between 20:00 and 08:00. A month
-        whose last day ends on one cycling day, followed by a first day that
-        already has one, is the sequence 1 -> 1 — no decrease, so no reset is
-        recorded and the new month's first day is swallowed. Longer downtime
-        loses more.
+        Two separate points here.
 
-        Declaring `TOTAL` with an explicit `last_reset` states the reset
-        instead of hoping to witness it. Local time, because that is the clock
-        the counts themselves roll over on.
+        Why `TOTAL` + `last_reset` rather than `TOTAL_INCREASING`:
+        TOTAL_INCREASING *infers* a reset from a decrease it actually observes,
+        and this integration deliberately does not poll between 20:00 and
+        08:00. A month whose last day ends on one cycling day, followed by a
+        first day that already has one, is the sequence 1 -> 1 — no decrease,
+        so no reset is recorded and the new month's first day is swallowed.
+        Declaring the reset states it instead of hoping to witness it.
+
+        Why it comes from the coordinator's data and not from `dt_util.now()`:
+        the timestamp has to describe the *snapshot*, not the moment someone
+        reads the property. A poll starting at 23:59:59 on the 31st computes
+        that month's counts and may finish a second into the next month —
+        reading the clock here would publish the new month as those figures'
+        reset point and file them under the wrong cycle. Reading the clock also
+        means the value can change without the state changing, which is not
+        something a reset timestamp should do.
         """
         if self.entity_description.key not in MONTHLY_SENSOR_KEYS:
             return None
-        return dt_util.now().replace(
-            day=1, hour=0, minute=0, second=0, microsecond=0
-        )
+        data = self.coordinator.data
+        month_start = data.get("month_start") if data else None
+        if month_start is None:
+            return None
+        return dt_util.start_of_local_day(month_start)

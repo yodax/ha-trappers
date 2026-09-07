@@ -19,6 +19,7 @@ ACCOUNT_NAME = "Alex"
 COMPONENT_DIR = Path(__file__).parent.parent / "custom_components" / "trappers"
 
 SAMPLE_DATA = {
+    "month_start": date(2026, 9, 1),
     "balance": 10000.0,
     "balance_value_eur": 95.24,
     "cycling_days_total": 131,
@@ -161,9 +162,7 @@ async def test_monthly_sensors_declare_an_explicit_reset(hass: HomeAssistant) ->
 
     await _setup_entry(hass, SAMPLE_DATA)
 
-    month_start = dt_util.now().replace(
-        day=1, hour=0, minute=0, second=0, microsecond=0
-    )
+    month_start = dt_util.start_of_local_day(SAMPLE_DATA["month_start"])
     for entity_id in (
         "sensor.alex_cycling_days_this_month",
         "sensor.alex_points_earned_this_month",
