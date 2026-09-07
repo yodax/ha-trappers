@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.vscode/
+.DS_Store
+
+# Personal deploy/test tooling — tied to one person's own infrastructure,
+# kept local rather than published in this public repo.
+.claude/skills/deploy-test/
+.playwright-mcp/
+
+# Never commit anything account-specific. The real test account lives outside
+# the repo entirely (~/.config/trappers-test/account.env); these patterns are
+# belt-and-braces for captured API responses, which contain a real person's
+# home address, phone number and employer employee number.
+.secrets/
+secrets.env
+*.secret
+capture/
+*-response.json
+*-capture.json

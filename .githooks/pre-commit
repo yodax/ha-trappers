@@ -1,0 +1,186 @@
+#!/bin/bash
+# pre-commit — leak guard for this public repo.
+#
+# This integration is developed against a real corporate account, and the Trappers API's
+# own responses carry a live person's home address, telephone number, employer employee
+# numbers and a corporate email domain alongside the two or three numbers the sensors
+# actually want. Every one of those is one careless `git add` away from being permanently
+# public — GitHub keeps deleted-file content reachable by commit SHA even after a
+# force-push, so "notice it later and remove it" is not a recovery path. Hence a
+# preventive gate rather than a note in CLAUDE.md.
+#
+# Enable with:  git config core.hooksPath .githooks
+# Verify with:  git config core.hooksPath
+# Test with:    .githooks/test-pre-commit.sh
+#
+# Escape hatch: SKIP_LEAK_CHECK=1 git commit ...  — for a deliberate, reviewed exception
+# only. If you are reaching for it, the string probably really should not be committed.
+#
+# ── Three lessons are baked into the shape of this file ───────────────────────────────
+#
+# 1. WHY PYTHON, NOT A grep PIPELINE. The first version filtered added lines with
+#    `grep -E '^\+' | grep -v '^\+\+\+'`. On this machine `grep` is ugrep, which rejects
+#    `^\+\+\+` ("invalid syntax") — the pipeline errored, `|| true` swallowed it, and the
+#    hook exited 0 on a staged diff containing a live corporate email address. It was
+#    installed, looked right, and guarded nothing. Python's `re` has one dialect
+#    everywhere, and every subprocess failure below aborts the commit rather than
+#    passing it.
+#
+# 2. WHY THE SENSITIVE PATTERNS ARE NOT IN THIS FILE. The second version listed the real
+#    email address, postal code, phone number and employee numbers inline as patterns —
+#    and was correctly blocked by itself on the very first commit. A public repo cannot
+#    carry the list of strings it is guarding; the guard would be the leak. So this file
+#    holds only patterns that are generic infrastructure vocabulary (safe to publish),
+#    and loads the identity-specific ones from a file outside the repo.
+#
+# 3. WHY .githooks/ IS EXEMPT FROM THE GENERIC PATTERNS. v3 then blocked its own test
+#    fixtures — test-pre-commit.sh has to contain a sample LAN address to assert that
+#    LAN addresses are blocked. The exemption below is scoped to .githooks/ and to the
+#    generic half only: identity patterns still apply there, because .githooks/ is
+#    exactly where lesson 2's mistake would land. See GENERIC_EXEMPT_PREFIX.
+set -uo pipefail
+
+if [ "${SKIP_LEAK_CHECK:-0}" = "1" ]; then
+  echo "pre-commit: leak check SKIPPED via SKIP_LEAK_CHECK=1" >&2
+  exit 0
+fi
+
+PATTERN_FILE="${TRAPPERS_LEAK_PATTERNS:-$HOME/.config/trappers-test/leak-patterns.txt}"
+
+PATTERN_FILE="$PATTERN_FILE" python3 - <<'PYEOF'
+import os
+import re
+import subprocess
+import sys
+
+# Generic patterns. These are ordinary infrastructure vocabulary — publishing them
+# reveals nothing about any particular person or network, so they live in the repo.
+#
+# They are NOT applied to files under .githooks/, because this file and its test suite
+# have to contain these very strings in order to define and exercise them — the third
+# self-block of this hook's development. The exemption is deliberately narrow and does
+# NOT extend to the identity patterns: nothing in the tree, this directory included, may
+# contain a real secret. That asymmetry is the whole point. It is asserted by
+# test-pre-commit.sh, which checks both halves: a synthetic LAN address under .githooks/
+# is allowed, an identity-pattern match under .githooks/ is still blocked.
+GENERIC_EXEMPT_PREFIX = ".githooks/"
+
+GENERIC = [
+    (r"\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", "private/loopback IP address"),
+    (r"\b192\.168\.\d{1,3}\.\d{1,3}\b",            "private LAN address"),
+    (r"\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b", "private LAN address"),
+    (r"pct\s+(?:exec|push|enter)",                 "Proxmox container command"),
+    (r"\bproxmox\b",                               "hypervisor name"),
+    (r"ssh\s+pve\b",                               "homelab SSH alias"),
+    (r"/tank/docker",                              "homelab storage path"),
+    (r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.", "JWT (a real session token)"),
+    (r"\bNL\d{2}[A-Z]{4}\d{10}\b",                 "IBAN"),
+]
+
+# Identity-specific patterns, loaded from outside the repo. See lesson 2 in the header.
+# Format: <regex><TAB><description>, '#' comments and blank lines ignored.
+pattern_file = os.environ["PATTERN_FILE"]
+private = []
+loaded_private = False
+if os.path.exists(pattern_file):
+    loaded_private = True
+    with open(pattern_file, encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            rx, _, desc = line.partition("\t")
+            rx = rx.strip()
+            if not rx:
+                continue
+            try:
+                re.compile(rx)
+            except re.error as exc:
+                sys.stderr.write(
+                    "pre-commit: %s line %d is not a valid regex (%s).\n"
+                    "Refusing the commit rather than checking with a broken pattern "
+                    "list.\n" % (pattern_file, lineno, exc)
+                )
+                sys.exit(1)
+            private.append((rx, (desc.strip() or "private pattern")))
+
+
+def run(args):
+    p = subprocess.run(args, capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.stderr.write(
+            "pre-commit: leak check could not run (%s exited %d):\n%s\n"
+            "Refusing the commit rather than passing unchecked.\n"
+            % (" ".join(args), p.returncode, p.stderr.strip())
+        )
+        sys.exit(1)
+    return p.stdout
+
+
+staged = [f for f in run(
+    ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"]
+).splitlines() if f]
+
+if not staged:
+    sys.exit(0)
+
+# -U0: only changed lines. Added lines start with a single '+'; the '+++' file header is
+# metadata, not content. Renames and mode changes produce no '+' lines at all, which is
+# correct — they introduce no new content that could leak.
+diff = run(["git", "diff", "--cached", "-U0", "--"] + staged)
+
+current_file = None
+added = []
+for line in diff.splitlines():
+    if line.startswith("+++ "):
+        path = line[4:].strip()
+        current_file = path[2:] if path.startswith("b/") else path
+    elif line.startswith("+"):
+        added.append((current_file or "<unknown>", line[1:]))
+
+failed = False
+for pattern, why, generic in (
+    [(p, w, True) for p, w in GENERIC] + [(p, w, False) for p, w in private]
+):
+    rx = re.compile(pattern, re.IGNORECASE)
+    scope = [
+        (f, t) for f, t in added
+        if not (generic and f.startswith(GENERIC_EXEMPT_PREFIX))
+    ]
+    hits = [(f, t) for f, t in scope if rx.search(t)]
+    if not hits:
+        continue
+    if not failed:
+        sys.stderr.write(
+            "\npre-commit: BLOCKED — staged changes contain content that must not be "
+            "published.\n\n"
+        )
+        failed = True
+    sys.stderr.write("  %s:\n" % why)
+    for f, t in hits[:5]:
+        sys.stderr.write("    %s: %s\n" % (f, t.strip()[:120]))
+    if len(hits) > 5:
+        sys.stderr.write("    ... and %d more\n" % (len(hits) - 5))
+
+if failed:
+    sys.stderr.write(
+        "\n  Fix: replace with a placeholder (you@example.com, <your-employer>), or move\n"
+        "  the content into .claude/skills/deploy-test/ (gitignored) if it is deploy\n"
+        "  tooling. Override only deliberately: SKIP_LEAK_CHECK=1 git commit ...\n\n"
+    )
+    sys.exit(1)
+
+# Say plainly which half ran. A contributor cloning this repo has no identity-specific
+# pattern file and no secrets of the maintainer's to leak, so generic-only is the right
+# behaviour for them — but it must not look like full coverage to the maintainer, whose
+# file has simply gone missing.
+if not loaded_private:
+    sys.stderr.write(
+        "pre-commit: generic patterns only — no identity pattern file at %s.\n"
+        "  (Expected for an outside contributor. If you are the maintainer, restore it:\n"
+        "   the identity-specific patterns are deliberately not stored in this repo.)\n"
+        % pattern_file
+    )
+
+sys.exit(0)
+PYEOF
