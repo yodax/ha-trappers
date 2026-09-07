@@ -68,6 +68,7 @@ code only.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -108,6 +109,12 @@ MAX_EVENT_PAGES = 20
 TRANSACTIONS_PAGE_LIMIT = 100
 MAX_TRANSACTION_PAGES = 12
 
+# Commute registrations are few — one on the probed account — but the endpoint
+# is paged like the rest, so it is walked like the rest rather than trusting
+# that the first page is all of them.
+COMMUTE_PAGE_LIMIT = 100
+MAX_COMMUTE_PAGES = 5
+
 # The webshop catalogue, from which the points→euro rate is derived. One page
 # covers it comfortably — 99 articles on the probed account — but it is paged
 # properly anyway.
@@ -117,7 +124,7 @@ MAX_ARTICLE_PAGES = 10
 # A gift card's face value, as it appears in the article name: "bol. cadeaukaart
 # € 25", "VVV Cadeaukaart € 100". Dutch number formatting, so "1.000,00" is a
 # thousand euros, not one.
-FACE_VALUE_RE = re.compile(r"€\s*([\d.,]+)")
+FACE_VALUE_RE = re.compile(r"€\s*(\d[\d.,\s\u00a0]*)")
 
 # Guards on deriving a single rate from the catalogue. The probed account gave
 # 59 priced articles at *exactly* one rate, so these thresholds are nowhere near
@@ -126,7 +133,12 @@ FACE_VALUE_RE = re.compile(r"€\s*([\d.,]+)")
 # catalogue with two rates means the single-rate model is wrong, and that is
 # worth surfacing as an unknown rather than papering over.
 MIN_PRICED_ARTICLES = 5
-MIN_MODE_SHARE = 0.6
+# A *clear* plurality, and strictly greater. At 0.6-inclusive a 6-vs-4 split
+# still produced a confident rate, which flatly contradicted the promise that a
+# catalogue without one consistent rate reads `unknown`. The probed catalogue is
+# 100% uniform, so a real one is nowhere near this bound; anything that is means
+# the single-rate model has stopped holding and should say so.
+MIN_MODE_SHARE = 0.8
 
 # How long a derived rate is reused. It is a term of the employer's contract
 # with FiscFree, so it effectively never changes; re-deriving it every poll
@@ -151,6 +163,36 @@ def _month_start(today: date) -> date:
     return today.replace(day=1)
 
 
+def _is_number(value: Any) -> bool:
+    """True for a real, finite number.
+
+    `isinstance(x, (int, float))` alone is not enough. `True` is an `int` in
+    Python, so a boolean would sail through and then be arithmetic'd; and JSON
+    can carry `Infinity`/`NaN`, which reach a sensor state as "inf"/"nan" or
+    raise `OverflowError` on conversion rather than being caught here.
+    """
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _parse_date(raw: Any) -> date | None:
+    """Parse a "YYYY-MM-DD" field, or None if it is absent or unusable.
+
+    Never raises and never repeats the offending value: a malformed date is a
+    field this client cannot use, and the value itself may be anything the
+    server put there — which must not reach the log. See the module docstring.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
 class TrappersApiClient:
     """Talks to the Trappers API for one account."""
 
@@ -172,9 +214,11 @@ class TrappersApiClient:
         The token is valid for four hours. Rather than tracking its expiry,
         this client re-logs-in when a request comes back 401 (see
         ``_async_request``) — one fewer moving part than a scheduled refresh,
-        With poll slots three hours apart the token has always expired by the
-        next poll, so in practice this is one extra round-trip per poll — five
-        a day — in exchange for no expiry bookkeeping.
+        The token lives four hours and the slots are three apart, so it does
+        *not* reliably expire between polls — roughly three of the five daily
+        polls pay a 401 plus a login, the rest reuse the token. Either way it is
+        a handful of extra round-trips a day in exchange for no expiry
+        bookkeeping at all.
 
         The login response's ``userDetails`` object carries the whole account
         holder — name, address, telephone number, employer employee numbers.
@@ -274,16 +318,40 @@ class TrappersApiClient:
     async def _async_fetch_all(
         self, method: str, url: str, what: str, *, page_limit: int, max_pages: int
     ) -> list[Any]:
-        """Page through a list endpoint until every item has been collected."""
+        """Page through a list endpoint until every item has been collected.
+
+        Two things here are deliberate, and both were bugs first:
+
+        The offset advances by **how many items have actually been collected**,
+        not by `page * page_limit`. A server that caps its page size below the
+        requested limit would otherwise make this skip every record between the
+        short page's end and the next requested offset — silently, since the
+        response still looks well-formed.
+
+        An **empty page while `total` says there is more is an error**, not a
+        stopping condition. Treating it as "done" meant a server answering
+        `{"items": [], "total": 100}` produced a confident `cycling_days_total`
+        of zero: a plausible number, wrong, and indistinguishable on a
+        dashboard from a genuinely new account.
+        """
         collected: list[Any] = []
-        for page in range(max_pages):
+        for _page in range(max_pages):
             payload = await self._async_request(
-                method, url, params={"limit": page_limit, "offset": page * page_limit}
+                method, url, params={"limit": page_limit, "offset": len(collected)}
             )
             items, total = self._validate_page(payload, what)
-            collected.extend(items)
-            if len(collected) >= total or not items:
+
+            if len(collected) >= total:
                 return collected
+            if not items:
+                raise TrappersApiError(
+                    f"Unexpected {what} response: an empty page while {total} "
+                    f"item(s) were promised and {len(collected)} collected"
+                )
+            collected.extend(items)
+            if len(collected) >= total:
+                return collected
+
         raise TrappersApiError(
             f"Gave up paging {what} after {max_pages} pages — the endpoint is "
             "returning more items than this client is willing to fetch"
@@ -294,10 +362,10 @@ class TrappersApiClient:
     async def async_get_balance(self) -> float:
         """Current points balance, from the cheap single-request poll endpoint."""
         payload = await self._async_request("GET", STATUS_URL)
-        if not isinstance(payload, dict) or not isinstance(
-            payload.get("balance"), (int, float)
-        ):
-            raise TrappersApiError("Unexpected status response: no numeric 'balance'")
+        if not isinstance(payload, dict) or not _is_number(payload.get("balance")):
+            raise TrappersApiError(
+                "Unexpected status response: no finite numeric 'balance'"
+            )
         return float(payload["balance"])
 
     async def _async_get_cycling_days(self, today: date) -> dict[str, Any]:
@@ -321,13 +389,14 @@ class TrappersApiClient:
                 raise TrappersApiError("Unexpected events response: item is not an object")
             if item.get("status") == EVENT_STATUS_DUPLICATE:
                 continue
-            raw_date = item.get("date")
-            if not isinstance(raw_date, str):
-                raise TrappersApiError("Unexpected events response: item has no 'date'")
-            try:
-                dates.add(date.fromisoformat(raw_date))
-            except ValueError as err:
-                raise TrappersApiError(f"Unparseable event date: {err}") from err
+            parsed = _parse_date(item.get("date"))
+            if parsed is None:
+                # Deliberately does not repeat the offending value: it is
+                # server-controlled text and this error reaches the log.
+                raise TrappersApiError(
+                    "Unexpected events response: item has no usable 'date'"
+                )
+            dates.add(parsed)
 
         month_start = _month_start(today)
         return {
@@ -366,17 +435,18 @@ class TrappersApiClient:
                         "Unexpected transactions response: item is not an object"
                     )
                 raw_date = item.get("date")
-                if not isinstance(raw_date, str):
+                stamp = None
+                if isinstance(raw_date, str):
+                    try:
+                        # "YYYY-MM-DDTHH:MM:SS" here, not the plain date on events.
+                        stamp = datetime.fromisoformat(raw_date).date()
+                    except ValueError:
+                        stamp = None
+                if stamp is None:
+                    # No value interpolation — see the note on events above.
                     raise TrappersApiError(
-                        "Unexpected transactions response: item has no 'date'"
+                        "Unexpected transactions response: item has no usable 'date'"
                     )
-                try:
-                    # "YYYY-MM-DDTHH:MM:SS" here, unlike the plain dates on events.
-                    stamp = datetime.fromisoformat(raw_date).date()
-                except ValueError as err:
-                    raise TrappersApiError(
-                        f"Unparseable transaction date: {err}"
-                    ) from err
 
                 if stamp < month_start:
                     # Newest first, so everything from here on is older still.
@@ -384,9 +454,10 @@ class TrappersApiClient:
                     break
 
                 amount = item.get("amount")
-                if not isinstance(amount, (int, float)):
+                if not _is_number(amount):
                     raise TrappersApiError(
-                        "Unexpected transactions response: item has no numeric 'amount'"
+                        "Unexpected transactions response: item has no finite "
+                        "numeric 'amount'"
                     )
                 if amount > 0:
                     total_earned += float(amount)
@@ -398,32 +469,66 @@ class TrappersApiClient:
             f"Gave up paging transactions after {MAX_TRANSACTION_PAGES} pages"
         )
 
-    async def _async_get_commute_distance_m(self) -> int | None:
-        """One-way commute distance in metres, or None if none is registered."""
-        payload = await self._async_request("GET", COMMUTE_URL)
-        items, _total = self._validate_page(payload, "commute")
+    async def _async_get_commute_distance_m(self, today: date) -> int | None:
+        """The commute registered for *today*, in metres, or None if there is none.
 
-        newest: dict[str, Any] | None = None
-        newest_start: date | None = None
+        Picking simply the newest `startDate` was wrong in both directions: a
+        registration starting next month would immediately override the one
+        actually in force, and a registration that ended last year would go on
+        being reported forever. Both produce a confident, plausible, wrong
+        distance. So the item has to be in force today — started, and not
+        ended — and among those the most recently started one wins.
+        """
+        items = await self._async_fetch_all(
+            "GET",
+            COMMUTE_URL,
+            "commute",
+            page_limit=COMMUTE_PAGE_LIMIT,
+            max_pages=MAX_COMMUTE_PAGES,
+        )
+
+        current: dict[str, Any] | None = None
+        current_start: date | None = None
+        unreadable = 0
         for item in items:
             if not isinstance(item, dict):
                 raise TrappersApiError("Unexpected commute response: item is not an object")
-            raw_start = item.get("startDate")
-            try:
-                start = date.fromisoformat(raw_start) if isinstance(raw_start, str) else None
-            except ValueError as err:
-                raise TrappersApiError(f"Unparseable commute start date: {err}") from err
-            if newest_start is None or (start is not None and start > newest_start):
-                newest, newest_start = item, start
 
-        if newest is None:
+            start = _parse_date(item.get("startDate"))
+            if start is None:
+                # Cannot establish that this registration is in force, so it
+                # cannot be used. Counted, not silently dropped — see below.
+                unreadable += 1
+                continue
+            if start > today:
+                continue  # Not in force yet.
+            end = _parse_date(item.get("endDate"))
+            if item.get("endDate") is not None and end is None:
+                unreadable += 1
+                continue
+            if end is not None and end < today:
+                continue  # Already expired.
+
+            if current_start is None or start > current_start:
+                current, current_start = item, start
+
+        if current is None:
+            if unreadable:
+                # Rows exist but none could be read. That is a schema change,
+                # not an account without a commute, and it should be loud
+                # rather than quietly reporting `unknown` forever.
+                raise TrappersApiError(
+                    f"Unexpected commute response: {unreadable} registration(s) "
+                    "with no usable start/end date"
+                )
+            # Genuinely nothing in force today — a legitimate `unknown`.
             return None
-        distance = newest.get("distance")
+        distance = current.get("distance")
         if distance is None:
             return None
-        if not isinstance(distance, (int, float)):
+        if not _is_number(distance):
             raise TrappersApiError(
-                "Unexpected commute response: 'distance' is not numeric"
+                "Unexpected commute response: 'distance' is not a finite number"
             )
         return int(distance)
 
@@ -433,29 +538,44 @@ class TrappersApiClient:
 
         Gift cards carry their face value in the name ("bol. cadeaukaart € 25").
         Physical goods do not — a laptop's retail value is nowhere in the
-        response — so those simply return None and take no part in the rate.
+        response — so those return None and take no part in the rate.
+
+        Refuses to guess. A name carrying **more than one** euro amount
+        ("Artikel van € 100 voor € 25") is ambiguous: picking the first match
+        silently invented a face value that was 4x wrong. Ambiguous means None,
+        which drops the article rather than poisoning the rate.
         """
         if not isinstance(article_name, str):
             return None
-        match = FACE_VALUE_RE.search(article_name)
-        if not match:
+
+        matches = FACE_VALUE_RE.findall(article_name)
+        if len(matches) != 1:
             return None
 
-        raw = match.group(1).strip(".,")
+        raw = matches[0].strip(".,\u00a0 ")
         if "," in raw:
             # Dutch decimal comma: "1.000,00" is a thousand euros.
-            raw = raw.replace(".", "").replace(",", ".")
-        elif raw.count(".") == 1 and len(raw.rsplit(".", 1)[1]) == 3:
-            # "1.000" with no comma is also a thousands separator, not a decimal.
-            raw = raw.replace(".", "")
+            raw = raw.replace(".", "").replace(" ", "").replace("\u00a0", "")
+            raw = raw.replace(",", ".")
+        else:
+            groups = re.split(r"[.\s\u00a0]", raw)
+            if len(groups) > 1 and all(len(g) == 3 for g in groups[1:]):
+                # "1.000" / "1 000" with no comma is a thousands separator.
+                raw = "".join(groups)
+            elif len(groups) > 1:
+                # Neither a clean decimal nor a clean thousands grouping.
+                return None
+
         try:
             value = float(raw)
         except ValueError:
             return None
-        return value if value > 0 else None
+        return value if value > 0 and math.isfinite(value) else None
 
     @classmethod
-    def _derive_points_per_euro(cls, items: list[Any]) -> float | None:
+    def _derive_points_per_euro(
+        cls, items: list[Any], today: date | None = None
+    ) -> float | None:
         """Points charged per euro of face value, as the mode across the catalogue.
 
         **The mode, not the mean.** A single mispriced or oddly-named article
@@ -467,17 +587,38 @@ class TrappersApiClient:
         Returns None rather than raising: a catalogue this client cannot read a
         rate from is a missing value, not a broken integration.
         """
+        today = today or date.today()
         rates: list[float] = []
         for item in items:
             if not isinstance(item, dict):
                 raise TrappersApiError("Unexpected articles response: item is not an object")
             if item.get("archived") or not item.get("availableInPublicShop"):
                 continue
+
+            # An article you cannot buy today tells you nothing about today's
+            # rate. `availableUntil` was null on every article of the probed
+            # catalogue, so this path is untested against real expiry data —
+            # which is the reason to honour the field rather than assume it
+            # stays null.
+            available_from = _parse_date(item.get("availableFrom"))
+            if available_from is not None and available_from > today:
+                continue
+            available_until = _parse_date(item.get("availableUntil"))
+            if available_until is not None and available_until < today:
+                continue
+
+            # A handling fee makes the real cost higher than `trappersPrice`,
+            # so such an article would understate the rate. Every article on the
+            # probed catalogue had `handlingFeeApplies: false`; rather than
+            # model a fee this client has never seen applied, drop the article.
+            if item.get("handlingFeeApplies"):
+                continue
+
             face_value = cls._parse_face_value(item.get("articleName"))
             if face_value is None:
                 continue
             price = item.get("trappersPrice")
-            if not isinstance(price, (int, float)) or price <= 0:
+            if not _is_number(price) or price <= 0:
                 continue
             # Rounded before counting so float noise can't split the mode.
             rates.append(round(price / face_value, 2))
@@ -536,7 +677,7 @@ class TrappersApiClient:
             page_limit=ARTICLES_PAGE_LIMIT,
             max_pages=MAX_ARTICLE_PAGES,
         )
-        rate = self._derive_points_per_euro(items)
+        rate = self._derive_points_per_euro(items, now.date())
         if rate is None:
             # Not cached: an unreadable catalogue should resolve on the next
             # poll rather than stay unknown for a day.
@@ -566,7 +707,7 @@ class TrappersApiClient:
             data["points_earned_this_month"] = (
                 await self._async_get_points_earned_this_month(today)
             )
-            distance_m = await self._async_get_commute_distance_m()
+            distance_m = await self._async_get_commute_distance_m(today)
             data["commute_distance"] = (
                 round(distance_m / 1000, 2) if distance_m is not None else None
             )
@@ -582,6 +723,11 @@ class TrappersApiClient:
             # Belt-and-braces: the checks above are meant to catch every shape
             # problem explicitly, but a renamed field must never reach the log
             # as a raw traceback.
-            raise TrappersApiError(f"Unexpected response shape from Trappers API: {err}") from err
+            # The exception's text can quote a server-supplied value, so only
+            # its type is reported. The specific checks above are where a useful
+            # message comes from; this is the net beneath them.
+            raise TrappersApiError(
+                f"Unexpected response shape from Trappers API ({type(err).__name__})"
+            ) from err
 
         return data

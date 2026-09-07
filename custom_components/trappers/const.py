@@ -40,3 +40,9 @@ MIN_UPDATE_INTERVAL = timedelta(seconds=60)
 # The account's points balance is denominated in "trappers" (the scheme's own
 # name for its points). Not a physical unit, so it is passed through as-is.
 UNIT_TRAPPERS = "trappers"
+
+# The sensors that count within a calendar month and reset on the 1st. They are
+# SensorStateClass.TOTAL with an explicit `last_reset` rather than
+# TOTAL_INCREASING, because nothing polls overnight and so the reset itself is
+# never observed — see TrappersSensor.last_reset.
+MONTHLY_SENSOR_KEYS = frozenset({"cycling_days_this_month", "points_earned_this_month"})

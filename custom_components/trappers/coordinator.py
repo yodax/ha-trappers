@@ -112,6 +112,24 @@ class TrappersCoordinator(DataUpdateCoordinator[dict]):
     Each entry adds its own fixed offset of up to 15 minutes after each slot,
     so that installs do not all arrive at exactly 08:00:00 — see
     `poll_jitter()`.
+
+    **The reschedule happens on failure too, and from the time the work
+    finished.** Both halves matter:
+
+    Home Assistant re-arms a failed refresh with `update_interval` unchanged
+    and applies no backoff of its own (`_schedule_refresh` in
+    `helpers/update_coordinator.py`). Recomputing only on success therefore
+    froze whatever interval was last set and repeated it forever — including
+    all night, and including the 60-second clamp, which turned the guard
+    against a hot loop into the cause of one. A failed poll now simply waits
+    for the next slot, which is the right behaviour anyway: points change once
+    a working day, so there is nothing worth retrying hard for.
+
+    Measuring from completion rather than from the start of the update also
+    fixes an off-by-a-poll. HA's timer may fire slightly early; the slot
+    arithmetic would then still select the slot being served, leaving a delta
+    of a second or two that the clamp rounded up to a whole extra poll a minute
+    later. By the time the request has finished, that ambiguity is gone.
     """
 
     def __init__(
@@ -144,12 +162,17 @@ class TrappersCoordinator(DataUpdateCoordinator[dict]):
             raise UpdateFailed(str(err)) from err
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             raise UpdateFailed(f"Error communicating with Trappers: {err}") from err
-
-        # Reschedule onto the next slot. Assigning here rather than in a
-        # separate timer keeps the schedule in one place; HA re-arms the
-        # listener with the new interval once this refresh completes.
-        self.update_interval = interval_until_next_poll(now, self._jitter)
-        _LOGGER.debug(
-            "Next Trappers poll at %s", next_poll_time(now, self._jitter).isoformat()
-        )
+        finally:
+            # In `finally`, so a failed poll waits for the next slot instead of
+            # repeating the last interval forever — see the class docstring.
+            self._reschedule()
         return data
+
+    def _reschedule(self) -> None:
+        """Point `update_interval` at the next slot, measured from right now."""
+        finished = dt_util.now()
+        self.update_interval = interval_until_next_poll(finished, self._jitter)
+        _LOGGER.debug(
+            "Next Trappers poll at %s",
+            next_poll_time(finished, self._jitter).isoformat(),
+        )

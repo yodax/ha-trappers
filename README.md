@@ -125,10 +125,14 @@ Home Assistant. Across the daylight-saving changes one gap is
 an hour shorter or longer in real time — the slots stay at 08:00 and 20:00
 local, which is the point.
 
-A poll is four requests (balance, cycling days, transactions, commute). The
-webshop catalogue behind the euro value is read at most once a day on top of
-that, since the rate is a contract term that does not move. That is about 20
-requests a day in total.
+A poll is four requests (balance, cycling days, transactions, commute), plus a
+re-login when the four-hour session token has lapsed since the last poll —
+which it has for roughly three of the five. The webshop catalogue behind the
+euro value is read once a day on top of that while the rate is known. Call it
+25-30 requests a day.
+
+If the catalogue cannot be read at all, it is retried each poll until it can,
+so the euro sensor resolves promptly rather than staying `unknown` for a day.
 
 Your sensors keep their values between polls; they do not go unavailable
 overnight. And you can always force an immediate refresh at any hour from

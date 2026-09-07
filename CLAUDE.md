@@ -320,8 +320,8 @@ calling.
   at most once per working day, when the collector unit reads the tag on
   arrival, so there is nothing to see overnight, and this is an unofficial API
   belonging to an employer benefits provider. Five polls × four requests is
-  ~20 requests/day, down from 192; the catalogue fetch behind the euro rate is
-  cached 24h on top. `POLL_HOURS` in `const.py`. See the schedule notes under
+  ~25-30 requests/day once re-logins are counted, down from 192; the catalogue
+  fetch behind the euro rate is cached 24h on top. `POLL_HOURS` in `const.py`. See the schedule notes under
   "Design decisions" for the traps.
 - **Every request gets an explicit `aiohttp.ClientTimeout`** and
   `aiohttp.ClientError`/`asyncio.TimeoutError` must surface as `UpdateFailed`,
@@ -351,7 +351,8 @@ calling.
 Implemented and deployed 2026-09-07: seven sensors, verified end-to-end
 against the live account and read back off a real Home Assistant instance.
 Shipped as 0.1.0, then 0.1.1 (entity IDs no longer carry the account's email
-address) and 0.2.0 (the euro sensor was overstating the balance by ~5%; polling moved
+address), 0.2.2 (an adversarial review found real scheduling, pagination and
+rate-qualification bugs — see "What a second reviewer caught" below) and 0.2.0 (the euro sensor was overstating the balance by ~5%; polling moved
 from a 30-minute interval to five fixed daytime slots). The corrections above came out of
 that work; these are the choices the code makes that the contract alone
 doesn't dictate.
@@ -390,8 +391,9 @@ doesn't dictate.
 
 - **A poll is four requests, not one.** `/status` alone answers the headline
   balance, but the activity sensors need `/events`, `/transactions` and
-  `/commute` too. Five slots a day makes that ~20 requests, plus the
-  once-daily `/articles` fetch behind the euro rate.
+  `/commute` too. Five slots a day makes that 20, plus ~3 re-logins (see the
+  token note below) and the once-daily `/articles` fetch — ~25-30 requests/day
+  in practice. The bare "20" that the slot count suggests understates it.
 
 - **The schedule is a moving `update_interval`, reassigned at the end of every
   successful `_async_update_data` to the gap until the next `POLL_HOURS` slot.**
@@ -484,10 +486,11 @@ doesn't dictate.
 
 - **Token handling is 401-driven re-login, not scheduled refresh.** The JWT
   lives four hours and `/api/security/token-refresh` exists, but a poll that
-  gets a 401 simply logs in again and retries once. With slots three hours
-  apart the token has always expired by the next poll, so in practice this is
-  one login per poll — still only five a day, in exchange for no expiry
-  bookkeeping at all. A second 401 straight after a successful login raises
+  gets a 401 simply logs in again and retries once. The token lives four hours
+  and the slots are three apart, so it does *not* reliably expire between polls
+  — roughly three of the five daily polls pay a 401 plus a login and the rest
+  reuse the token, which is where the real figure of ~25-30 requests/day comes
+  from rather than the bare 20 the slot count suggests. A second 401 straight after a successful login raises
   `TrappersApiError`, not `TrappersAuthError` — re-entering the password
   cannot fix that, so routing it through reauth would be a dead end.
 
@@ -523,6 +526,71 @@ doesn't dictate.
 - **Local test venv is Python 3.14** (`uv venv --python 3.14 .venv`),
   matching what recent Home Assistant requires. The system Python 3.11 cannot
   install `pytest-homeassistant-custom-component`.
+
+## What a second reviewer caught (0.2.2)
+
+0.2.1 was reviewed adversarially by a second model after I had declared it
+ready. It found real bugs in code I had just finished writing tests for, which
+is the useful kind of humbling. Every finding below was reproduced before being
+fixed, and each now has a test that fails against the old behaviour.
+
+- **A failed poll pinned the schedule.** `update_interval` was recomputed only
+  on success, and HA re-arms a failed refresh with the interval unchanged and
+  no backoff of its own. So a failure froze the last interval and repeated it
+  forever — overnight included, and including the 60-second clamp, which turned
+  the guard against a hot loop into the cause of one. Now rescheduled in a
+  `finally`, and measured from when the work *finished*, which also removed a
+  bonus poll when HA's timer fired fractionally early.
+
+- **An empty page was treated as "done".** `{"items": [], "total": 100}`
+  produced a confident `cycling_days_total` of 0. Now an error. The offset also
+  advances by items actually collected rather than by `page * page_limit`, so a
+  server capping its page size can no longer make the client skip records.
+
+- **The euro rate over-claimed.** A 6-vs-4 catalogue split still yielded a rate,
+  flatly contradicting the README's promise of `unknown`; `availableFrom`,
+  `availableUntil` and `handlingFeeApplies` were all ignored; `"€ 1 000"` parsed
+  as €1 and `"Artikel van € 100 voor € 25"` took the wrong number. Threshold
+  raised to a strict 0.8, availability and fees honoured, and an ambiguous name
+  is now dropped rather than guessed at.
+
+- **Commute selection ignored validity.** It took the newest `startDate`, so a
+  registration starting next month immediately overrode the one in force and an
+  expired one was reported forever.
+
+- **The monthly sensors could lose a month.** `TOTAL_INCREASING` *infers* a
+  reset from a decrease it observes, and nothing polls overnight — so a month
+  ending on one cycling day followed by a first day already showing one is the
+  sequence 1 → 1, no reset recorded, first day swallowed. Now `TOTAL` with an
+  explicit `last_reset`.
+
+- **Errors could echo response content.** `date.fromisoformat()` puts the
+  rejected string in its own message, so interpolating the exception meant a
+  malformed field reached the log verbatim — contradicting this module's
+  "endpoint and status code only" rule.
+
+- **A test passed for the wrong reason.**
+  `ClientResponseError(request_info=None)` raises `AttributeError` the moment
+  anything formats it, so the transport-error test was exercising HA's
+  catch-all rather than this integration's aiohttp branch.
+
+- **Two documented claims were simply false**: the 4-hour token does not
+  reliably expire between 3-hour slots, and the catalogue is *not* fetched at
+  most once a day when the rate is unknown. Both corrected here and in the
+  README.
+
+- **The leak gate had holes**, and one of them had already been used: a real
+  account figure was redacted from the tree and from a published release note,
+  and then described in the commit message that performed the redaction, which
+  the gate never looked at. `.githooks/commit-msg` now scans messages with the
+  same patterns (shared via `leakcheck.py` so the two cannot drift). Also fixed:
+  a content line reading `++ x` renders as `+++ x` in a diff and was skipped as
+  a file header, and a pattern file that existed but defined nothing ran with no
+  identity coverage while reporting the private half as loaded. 31 hook cases
+  now, up from 22.
+
+The pattern worth remembering: every one of these produced a *plausible* value
+or a *green* test. None would have announced itself.
 
 ## Cutting a release
 

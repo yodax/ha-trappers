@@ -64,6 +64,43 @@ _commit() {
   return "$rc"
 }
 
+# _commit_msg <message> → 0 if the commit went through, 1 if a hook blocked it.
+# Content is benign; only the message varies, so this isolates the commit-msg hook.
+_commit_msg() {
+  fresh_repo
+  printf 'nothing to see here\n' > "$SCRATCH/probe.txt"
+  git -C "$SCRATCH" add probe.txt
+  local rc=0
+  LAST_OUT=$(git -C "$SCRATCH" commit -m "$1" 2>&1) || rc=1
+  if [ "$rc" -eq 0 ] && ! git -C "$SCRATCH" rev-parse --verify -q HEAD >/dev/null; then
+    echo "HARNESS BUG: commit reported success but created no commit:"
+    printf '%s\n' "$LAST_OUT" | sed 's/^/    /'
+    return 2
+  fi
+  return "$rc"
+}
+
+msg_should_block() {
+  local rc=0
+  _commit_msg "$2" || rc=$?
+  case "$rc" in
+    0) echo "FAIL: commit-msg did NOT block: $1"; fail=$((fail + 1)) ;;
+    1) echo "ok:   blocked $1"; pass=$((pass + 1)) ;;
+    *) echo "FAIL: harness error on: $1"; fail=$((fail + 1)) ;;
+  esac
+}
+
+msg_should_pass() {
+  local rc=0
+  _commit_msg "$2" || rc=$?
+  case "$rc" in
+    0) echo "ok:   allowed $1"; pass=$((pass + 1)) ;;
+    1) echo "FAIL: commit-msg blocked a clean message: $1"
+       printf '%s\n' "$LAST_OUT" | sed 's/^/    /'; fail=$((fail + 1)) ;;
+    *) echo "FAIL: harness error on: $1"; fail=$((fail + 1)) ;;
+  esac
+}
+
 should_block() {
   local rc=0
   _commit "$2" || rc=$?
@@ -149,5 +186,31 @@ PROBE_PATH="custom_components/trappers/api.py" should_block \
   "generic pattern outside .githooks/ still blocked" 'HOST = "192.168.8.60"'
 
 echo
+echo "── a '++' content line is content, not a diff header ──"
+# A staged line reading "++ x" renders as "+++ x" in the diff. Treating any "+++ "
+# line as the file header let an identity canary on such a line through unchecked.
+CANARY_FILE2="$WORK/patterns2.txt"
+printf '# synthetic\nZZQQ-CANARY-[0-9]{4}\tsynthetic canary\n' > "$CANARY_FILE2"
+TRAPPERS_LEAK_PATTERNS="$CANARY_FILE2" \
+  should_block "canary on a line beginning with ++" '++ ZZQQ-CANARY-1234'
+TRAPPERS_LEAK_PATTERNS="$CANARY_FILE2" \
+  should_block "canary on a line beginning with +++" '+++ ZZQQ-CANARY-1234'
+should_pass  "an ordinary ++ line with nothing secret" '++ just a diff-looking line'
+
+echo "── an existing but empty pattern file must not pass silently ──"
+EMPTY_FILE="$WORK/empty-patterns.txt"
+printf '# only comments, no patterns\n\n' > "$EMPTY_FILE"
+TRAPPERS_LEAK_PATTERNS="$EMPTY_FILE" \
+  should_block "empty pattern file aborts rather than running with no identity cover" \
+  'perfectly ordinary content'
+
+echo "── commit messages are scanned too ──"
+msg_should_pass  "an ordinary commit message" 'Fix the paging offset'
+msg_should_block "a LAN address in the message" 'Deploy tested against 192.168.8.60'
+msg_should_block "a homelab path in the message" 'copied into /tank/docker/homeassistant'
+msg_should_block "an IBAN in the message" 'removed NL91ABNA0417164300 from the fixture'
+TRAPPERS_LEAK_PATTERNS="$CANARY_FILE2" \
+  msg_should_block "an identity canary in the message" 'redacted ZZQQ-CANARY-1234 from README'
+
 echo "pre-commit leak-guard: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

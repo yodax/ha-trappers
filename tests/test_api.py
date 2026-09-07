@@ -342,6 +342,14 @@ class TestAsyncGetData:
         assert data["cycling_days_this_month"] == 2
 
     async def test_events_are_paged_until_total_is_reached(self) -> None:
+        """The offset advances by items actually collected, not by page_limit.
+
+        A server that caps its page size below the requested limit would
+        otherwise make the client skip every record between the short page's
+        end and the next requested offset — silently, since each response still
+        looks well-formed. Here the first page returns 3 of 5, so the next
+        request must ask for offset 3, not offset 500.
+        """
         first = [event(f"2026-08-{day:02d}") for day in range(1, 4)]
         second = [event(f"2026-07-{day:02d}") for day in range(1, 3)]
         client, session = make_client(
@@ -355,7 +363,8 @@ class TestAsyncGetData:
         assert data["cycling_days_total"] == 5
         event_calls = [c for c in session.calls if c[1] == EVENTS_URL]
         assert len(event_calls) == 2
-        assert event_calls[1][2]["params"]["offset"] == 500
+        assert event_calls[0][2]["params"]["offset"] == 0
+        assert event_calls[1][2]["params"]["offset"] == 3
 
     async def test_runaway_event_paging_raises_rather_than_looping(self) -> None:
         """A `total` that never gets reached must stop, not spin forever."""
@@ -841,3 +850,243 @@ class TestFaceValueParsing:
         articles = [gift_card("€ 1.000", 105000.0) for _ in range(MIN_PRICED_ARTICLES)]
 
         assert TrappersApiClient._derive_points_per_euro(articles) == 105.0
+
+
+class TestPaginationIntegrity:
+    """A well-formed response can still describe an incomplete result."""
+
+    async def test_empty_page_with_records_remaining_is_an_error(self) -> None:
+        """This silently reported zero lifetime cycling days.
+
+        `{"items": [], "total": 100}` used to satisfy the "no items means done"
+        stopping condition, producing a confident 0 — a plausible number,
+        wrong, and indistinguishable on a dashboard from a brand-new account.
+        """
+        client, _session = make_client(
+            responses(
+                **{
+                    EVENTS_URL: [
+                        FakeResponse(
+                            json_data={"limit": 500, "total": 100, "offset": 0, "items": []}
+                        )
+                    ]
+                }
+            )
+        )
+
+        with pytest.raises(TrappersApiError, match="empty page"):
+            await client.async_get_data(today=TODAY, now=NOW)
+
+    async def test_a_server_capping_page_size_does_not_skip_records(self) -> None:
+        """Offset follows what was collected, so short pages still add up."""
+        pages = [
+            page([event(f"2026-08-{d:02d}") for d in range(1, 3)], total=6),
+            page([event(f"2026-07-{d:02d}") for d in range(1, 3)], total=6),
+            page([event(f"2026-06-{d:02d}") for d in range(1, 3)], total=6),
+        ]
+        client, session = make_client(responses(**{EVENTS_URL: pages}))
+
+        data = await client.async_get_data(today=TODAY, now=NOW)
+
+        assert data["cycling_days_total"] == 6
+        offsets = [c[2]["params"]["offset"] for c in session.calls if c[1] == EVENTS_URL]
+        assert offsets == [0, 2, 4]
+
+
+class TestRateQualification:
+    async def test_a_sixty_forty_split_is_unknown(self) -> None:
+        """The README promises `unknown` for an inconsistent catalogue.
+
+        At a 0.6-inclusive threshold a 6-vs-4 split still produced a confident
+        rate, which contradicted that promise outright.
+        """
+        articles = [
+            *[gift_card(f"€ {n}", n * 105.0) for n in (10, 20, 25, 50, 100, 250)],
+            *[gift_card(f"€ {n}", n * 140.0) for n in (5, 15, 30, 75)],
+        ]
+
+        assert TrappersApiClient._derive_points_per_euro(articles, TODAY) is None
+
+    async def test_articles_not_yet_available_are_excluded(self) -> None:
+        articles = [
+            *[gift_card(f"€ {n}", n * 105.0) for n in (10, 20, 25, 50, 100)],
+            *[
+                gift_card(f"€ {n}", n * 999.0, availableFrom="2099-01-01")
+                for n in (5, 15, 30, 75, 200)
+            ],
+        ]
+
+        assert TrappersApiClient._derive_points_per_euro(articles, TODAY) == 105.0
+
+    async def test_expired_articles_are_excluded(self) -> None:
+        """`availableUntil` was null on every probed article, so honour it."""
+        articles = [
+            *[gift_card(f"€ {n}", n * 105.0) for n in (10, 20, 25, 50, 100)],
+            *[
+                gift_card(f"€ {n}", n * 999.0, availableUntil="2020-01-01")
+                for n in (5, 15, 30, 75, 200)
+            ],
+        ]
+
+        assert TrappersApiClient._derive_points_per_euro(articles, TODAY) == 105.0
+
+    async def test_articles_with_a_handling_fee_are_excluded(self) -> None:
+        """A fee makes the real cost higher, so such an article understates it."""
+        articles = [
+            *[gift_card(f"€ {n}", n * 105.0) for n in (10, 20, 25, 50, 100)],
+            *[
+                gift_card(f"€ {n}", n * 90.0, handlingFeeApplies=True)
+                for n in (5, 15, 30, 75, 200)
+            ],
+        ]
+
+        assert TrappersApiClient._derive_points_per_euro(articles, TODAY) == 105.0
+
+    async def test_an_ambiguous_name_is_dropped_rather_than_guessed(self) -> None:
+        """"Artikel van € 100 voor € 25" took the first amount and was 4x wrong."""
+        assert TrappersApiClient._parse_face_value("Artikel van € 100 voor € 25") is None
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            pytest.param("Cadeaukaart € 1 000", 1000.0, id="space-thousands"),
+            pytest.param("Cadeaukaart € 1.000", 1000.0, id="dot-thousands"),
+            pytest.param("Cadeaukaart € 1.00.0", None, id="nonsense-grouping"),
+        ],
+    )
+    def test_thousands_separators(self, name: str, expected: float | None) -> None:
+        """"€ 1 000" parsed as €1, a 1000x error in the rate."""
+        assert TrappersApiClient._parse_face_value(name) == expected
+
+
+class TestCommuteValidity:
+    def _commute(self, **kw) -> dict:
+        return {**DEFAULT_COMMUTE[0], **kw}
+
+    async def test_a_future_registration_does_not_override_the_current_one(self) -> None:
+        """Picking simply the newest startDate reported a commute not yet in force."""
+        client, _session = make_client(
+            responses(
+                **{
+                    COMMUTE_URL: [
+                        page(
+                            [
+                                self._commute(startDate="2025-03-04", distance=11000),
+                                self._commute(startDate="2099-01-01", distance=42000),
+                            ],
+                            limit=100,
+                        )
+                    ]
+                }
+            )
+        )
+
+        data = await client.async_get_data(today=TODAY, now=NOW)
+
+        assert data["commute_distance"] == 11.0
+
+    async def test_an_expired_registration_is_not_reported_forever(self) -> None:
+        client, _session = make_client(
+            responses(
+                **{
+                    COMMUTE_URL: [
+                        page(
+                            [
+                                self._commute(
+                                    startDate="2020-01-01",
+                                    endDate="2021-01-01",
+                                    distance=42000,
+                                )
+                            ],
+                            limit=100,
+                        )
+                    ]
+                }
+            )
+        )
+
+        data = await client.async_get_data(today=TODAY, now=NOW)
+
+        assert data["commute_distance"] is None
+
+    async def test_rows_that_cannot_be_read_are_loud_not_silently_unknown(self) -> None:
+        """All-unreadable rows are a schema change, not an account with no commute."""
+        client, _session = make_client(
+            responses(
+                **{
+                    COMMUTE_URL: [
+                        page([self._commute(startDate="whenever")], limit=100)
+                    ]
+                }
+            )
+        )
+
+        with pytest.raises(TrappersApiError, match="no usable start/end date"):
+            await client.async_get_data(today=TODAY, now=NOW)
+
+
+class TestNumericValidation:
+    async def test_a_boolean_is_not_accepted_as_a_balance(self) -> None:
+        """`True` is an `int` in Python and would have been arithmetic'd."""
+        client, _session = make_client(
+            responses(**{STATUS_URL: [FakeResponse(json_data={"balance": True})]})
+        )
+
+        with pytest.raises(TrappersApiError):
+            await client.async_get_data(today=TODAY, now=NOW)
+
+    async def test_a_nonfinite_distance_is_rejected_not_crashed_on(self) -> None:
+        """int(float('inf')) raises OverflowError, which is not an UpdateFailed."""
+        client, _session = make_client(
+            responses(
+                **{
+                    COMMUTE_URL: [
+                        page(
+                            [{**DEFAULT_COMMUTE[0], "distance": float("inf")}],
+                            limit=100,
+                        )
+                    ]
+                }
+            )
+        )
+
+        with pytest.raises(TrappersApiError, match="finite"):
+            await client.async_get_data(today=TODAY, now=NOW)
+
+
+class TestErrorsDoNotEchoResponseContent:
+    """Errors reach the HA log, so they must not repeat server-supplied values.
+
+    `date.fromisoformat()` puts the rejected string into its own message, so
+    interpolating the exception meant a malformed field could be logged
+    verbatim — contradicting this module's "endpoint and status code only" rule.
+    """
+
+    CANARY = "CANARY-d41d8cd98f00b204"
+
+    @pytest.mark.parametrize(
+        ("url", "payload"),
+        [
+            pytest.param(
+                EVENTS_URL,
+                {"items": [{"date": CANARY, "status": "PROCESSED"}], "total": 1, "offset": 0},
+                id="event-date",
+            ),
+            pytest.param(
+                TRANSACTIONS_URL,
+                {"items": [{"date": CANARY, "amount": 1.0}], "total": 1, "offset": 0},
+                id="transaction-date",
+            ),
+        ],
+    )
+    async def test_the_offending_value_is_not_in_the_message(
+        self, url: str, payload: dict
+    ) -> None:
+        client, _session = make_client(
+            responses(**{url: [FakeResponse(json_data=payload)]})
+        )
+
+        with pytest.raises(TrappersApiError) as excinfo:
+            await client.async_get_data(today=TODAY, now=NOW)
+
+        assert self.CANARY not in str(excinfo.value)

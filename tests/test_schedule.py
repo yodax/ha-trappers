@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -19,7 +19,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.trappers.api import TrappersApiClient
+from custom_components.trappers.api import (
+    TrappersApiClient,
+    TrappersApiError,
+    TrappersAuthError,
+)
 from custom_components.trappers.const import (
     CONF_EMAIL,
     CONF_PASSWORD,
@@ -368,3 +372,84 @@ class TestJitteredSlots:
         now = local(2026, 9, 7, 11, 7)
 
         assert interval_until_next_poll(now, self.JITTER) >= MIN_UPDATE_INTERVAL
+
+
+class TestReschedulingAfterFailure:
+    """HA re-arms a failed refresh with `update_interval` unchanged and applies
+    no backoff of its own (`_schedule_refresh` in
+    `homeassistant/helpers/update_coordinator.py`). Recomputing the schedule
+    only on success therefore froze whatever interval was last set and repeated
+    it forever — including all night, and including the 60-second clamp, which
+    turned the guard against a hot loop into the cause of one.
+    """
+
+    async def test_a_failed_poll_still_moves_to_the_next_slot(
+        self, hass: HomeAssistant
+    ) -> None:
+        coordinator = await _coordinator(hass)
+        coordinator.client.async_get_data.side_effect = TrappersApiError("boom")
+
+        await coordinator.async_refresh()
+
+        assert coordinator.last_update_success is False
+        # Not stuck on whatever the previous interval happened to be.
+        expected = interval_until_next_poll(
+            dt_util.now(), poll_jitter(coordinator.config_entry.entry_id)
+        )
+        assert abs(coordinator.update_interval - expected) < timedelta(seconds=5)
+
+    async def test_repeated_failures_never_settle_into_a_one_minute_loop(
+        self, hass: HomeAssistant
+    ) -> None:
+        """The worst case of the old behaviour: a clamped interval, then failures.
+
+        A manual refresh moments before a slot set the interval to the 60s
+        clamp; every subsequent failure kept it, hammering the API once a
+        minute indefinitely.
+        """
+        coordinator = await _coordinator(hass)
+        coordinator.update_interval = MIN_UPDATE_INTERVAL
+        coordinator.client.async_get_data.side_effect = TrappersApiError("boom")
+
+        for _ in range(3):
+            await coordinator.async_refresh()
+            assert coordinator.last_update_success is False
+            assert coordinator.update_interval > timedelta(minutes=5)
+
+    async def test_an_auth_failure_also_reschedules(self, hass: HomeAssistant) -> None:
+        """ConfigEntryAuthFailed leaves the flow to HA, but must not pin the timer."""
+        coordinator = await _coordinator(hass)
+        coordinator.client.async_get_data.side_effect = TrappersAuthError("bad password")
+        coordinator.update_interval = MIN_UPDATE_INTERVAL
+
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        assert coordinator.update_interval > timedelta(minutes=5)
+
+
+async def test_schedule_is_measured_from_when_the_work_finished(
+    hass: HomeAssistant,
+) -> None:
+    """HA's timer can fire slightly early; measuring from the start double-polls.
+
+    If the refresh begins a second before its slot, the slot arithmetic still
+    selects the slot being served, leaving a delta the clamp rounds up to a
+    whole extra poll a minute later. Measuring after the work removes the
+    ambiguity. Here `dt_util.now()` returns a pre-slot time on entry and a
+    post-slot time when the schedule is recomputed.
+    """
+    coordinator = await _coordinator(hass)
+    jitter = poll_jitter(coordinator.config_entry.entry_id)
+    slot = local(2026, 9, 7, 11) + jitter
+    times = [slot - timedelta(seconds=1), slot + timedelta(seconds=1)]
+
+    with patch(
+        "custom_components.trappers.coordinator.dt_util.now",
+        side_effect=lambda: times.pop(0) if times else slot + timedelta(seconds=1),
+    ):
+        await coordinator.async_refresh()
+
+    assert coordinator.last_update_success is True
+    # The 14:00 slot, roughly three hours out — not a 60-second bonus poll.
+    assert coordinator.update_interval > timedelta(hours=2)

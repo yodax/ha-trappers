@@ -145,3 +145,41 @@ async def test_nothing_user_visible_carries_the_account_email(hass: HomeAssistan
         ]
         for value in rendered:
             assert value is None or EMAIL not in str(value)
+
+
+async def test_monthly_sensors_declare_an_explicit_reset(hass: HomeAssistant) -> None:
+    """TOTAL + last_reset, not TOTAL_INCREASING.
+
+    TOTAL_INCREASING *infers* a reset from a decrease it observes, and this
+    integration deliberately does not poll between 20:00 and 08:00. A month
+    ending on one cycling day followed by a first day that already has one is
+    the sequence 1 -> 1: no decrease, so no reset recorded, and the new month's
+    first day is swallowed from long-term statistics.
+    """
+    from homeassistant.components.sensor import SensorStateClass
+    from homeassistant.util import dt as dt_util
+
+    await _setup_entry(hass, SAMPLE_DATA)
+
+    month_start = dt_util.now().replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    for entity_id in (
+        "sensor.alex_cycling_days_this_month",
+        "sensor.alex_points_earned_this_month",
+    ):
+        state = hass.states.get(entity_id)
+        assert state.attributes["state_class"] == SensorStateClass.TOTAL
+        assert state.attributes["last_reset"] == month_start.isoformat()
+
+
+async def test_non_monthly_sensors_have_no_last_reset(hass: HomeAssistant) -> None:
+    """last_reset on a lifetime or gauge sensor would be meaningless."""
+    await _setup_entry(hass, SAMPLE_DATA)
+
+    for entity_id in (
+        "sensor.alex_points_balance",
+        "sensor.alex_cycling_days_total",
+        "sensor.alex_commute_distance",
+    ):
+        assert "last_reset" not in hass.states.get(entity_id).attributes

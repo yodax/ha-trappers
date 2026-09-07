@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock
 import aiohttp
 import pytest
 from homeassistant.core import HomeAssistant
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 # Importing config_flow registers TrappersConfigFlow in HA's HANDLERS registry —
@@ -108,11 +110,33 @@ async def test_api_error_marks_failed_without_reauth(hass: HomeAssistant) -> Non
     assert not _active_reauth_flows(hass)
 
 
+def _response_error(status: int) -> aiohttp.ClientResponseError:
+    """A ClientResponseError that can actually be formatted.
+
+    Constructing one with `request_info=None` raises AttributeError on
+    `real_url` the moment anything renders it — so the previous fixture was
+    exercising HA's catch-all handler, not this integration's aiohttp branch,
+    and passed for the wrong reason.
+    """
+    request_info = aiohttp.RequestInfo(
+        url=URL("https://api.trappers.net/api/status"),
+        method="GET",
+        headers=CIMultiDictProxy(CIMultiDict()),
+        real_url=URL("https://api.trappers.net/api/status"),
+    )
+    return aiohttp.ClientResponseError(request_info=request_info, history=(), status=status)
+
+
+def test_the_response_error_fixture_is_renderable() -> None:
+    """Guards the trap above: a fixture that explodes when formatted is not a fixture."""
+    assert "api.trappers.net" in str(_response_error(500))
+
+
 @pytest.mark.parametrize(
     "exc",
     [
         aiohttp.ClientError("boom"),
-        aiohttp.ClientResponseError(request_info=None, history=(), status=500),
+        _response_error(500),
         TimeoutError("timed out"),
     ],
 )
