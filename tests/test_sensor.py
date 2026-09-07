@@ -20,7 +20,7 @@ COMPONENT_DIR = Path(__file__).parent.parent / "custom_components" / "trappers"
 
 SAMPLE_DATA = {
     "balance": 7574.0,
-    "balance_value_eur": 75.74,
+    "balance_value_eur": 72.13,
     "cycling_days_total": 131,
     "cycling_days_this_month": 1,
     "last_cycling_day": date(2026, 9, 1),
@@ -56,7 +56,7 @@ async def test_all_sensors_are_created_with_their_values(hass: HomeAssistant) ->
     }
     assert states == {
         "sensor.alex_points_balance": "7574.0",
-        "sensor.alex_points_balance_value": "75.74",
+        "sensor.alex_points_balance_value": "72.13",
         "sensor.alex_cycling_days_total": "131",
         "sensor.alex_cycling_days_this_month": "1",
         "sensor.alex_last_cycling_day": "2026-09-01",

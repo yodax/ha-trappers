@@ -223,30 +223,84 @@ Authorization: Bearer <token>
 the employer site's address, not the employee's home — still avoid logging
 it.
 
-### Orders
+### The webshop catalogue — where the real euro rate lives
 
 ```
-GET /api/articleOrders?limit=<n>&offset=<n>
+POST /api/articles?limit=<n>&offset=<n>
 Authorization: Bearer <token>
 ```
 
-→ **200** paged `{limit, total, offset, items: [...]}`. Each item has
-`orderNumber`, `orderDate`, `articleOrderStatus` (e.g. `EXPORTED`),
-`trapperToEuroConversionRatio` (**0.01** on one probed account — i.e. 100
-points = €1), `articleLines[]` with `trapperPrice`, plus `mutationLogs[]`
-containing the ordering person's **name**.
+Note: **POST**, not GET (a GET returns 405). Body can be `{}`.
 
-**Careful with this endpoint**: it is the only place the points→euro
-conversion ratio appears, but the response also carries names and an IBAN
-field. Confirmed live 2026-09-07 — an order item's keys are `id`,
-`orderNumber`, `orderDate`, `articleOrderStatus`, `articleLines`,
-`mutationLogs`, `exportDate`, `orderCancelledDate`, `bookHandlingCostsDate`,
+→ **200** paged `{limit, total, offset, items: [...]}`. An item's keys:
+`id`, `articleNumber`, `articleName`, `description`, `category`,
+`trappersPrice`, `purchasePrice` `{currency, amount}`, `salesPriceSupplier`
+`{currency, amount}`, `availableInPublicShop`, `archived`, `availableFrom`,
+`availableUntil`, `supplierName`, `handlingFee`, `handlingFeeApplies`,
+`requireIban`, `vatScale`, `attachments`, `internalRemark`, `property1`,
+`property2`. **No personal data at all** — the whole response is catalogue.
+
+99 articles on the probed account, all returned in a single page at
+`limit=400` (the limit is echoed verbatim, as on `/events`).
+`GET /api/categories` is the sibling endpoint, same paged envelope.
+
+#### The trap: `trapperToEuroConversionRatio` is not a spendable rate
+
+This is worth reading before "simplifying" the euro sensor back.
+
+`/api/articleOrders` carries a field called `trapperToEuroConversionRatio`
+(0.01 on the probed account). It is named like the answer, it looks like the
+answer, and 0.1.0 used it: `balance × 0.01`, giving €75.74 for a 7574-point
+balance. It is wrong, and it is wrong in the direction that flatters.
+
+It is an **identity**. Across all 99 catalogue articles,
+`purchasePrice / trappersPrice` was exactly `0.01` for every single one — the
+ratio just reproduces `purchasePrice`, which is the scheme's own cost basis,
+not a price anything can be bought at. The balance was overstated by the
+operator's margin, ~5%.
+
+The rate that can actually be spent is `trappersPrice` per euro of **face**
+value, taken off the article name — `"bol. cadeaukaart € 25"` at
+`trappersPrice: 2625` is **105 points per euro**. Uniform across all 59
+priced articles on the probed account, with no outliers. 7574 / 105 = €72.13,
+which is what the shop actually charges.
+
+**Nobody would have caught this from the API alone.** Both numbers are
+internally consistent; the ratio genuinely is a real field with a real
+meaning. It took a human looking at a real shop listing — "bol. cadeaukaart
+€ 25 / 2625 Trappers, so the pricing is a bit off" — to notice the sensor
+disagreed with the shop. Treat "field named like the thing I want" as a
+hypothesis to check against reality, not as the answer.
+
+Gift cards are also the *best* rate in the catalogue: physical goods run
+~131 points per euro of `salesPriceSupplier` (JBL Flip 7: 13209 pt / €100.83;
+Apple Watch Series 11: 48610 pt / €371.07), with one outlier at ~143. So the
+gift-card rate is the *best achievable* value of a balance, which is the right
+thing for a sensor to report — averaging the goods in would understate it.
+
+Don't hardcode 105. It is this employer's contract term, exactly as 0.01 was.
+
+### Orders — deliberately not called
+
+```
+GET /api/articleOrders?limit=<n>&offset=<n>
+```
+
+→ **200** paged. Item keys: `id`, `orderNumber`, `orderDate`,
+`articleOrderStatus` (e.g. `EXPORTED`), `articleLines`, `mutationLogs`,
+`exportDate`, `orderCancelledDate`, `bookHandlingCostsDate`,
 `trapperToEuroConversionRatio`, **`employee_id`** and **`ibanAccountNumber`**.
-That is the worst response in the API to handle carelessly. If a euro-value
-sensor is wanted, read only
-`trapperToEuroConversionRatio` from the newest order and drop the rest —
-and handle "no orders yet" (`total: 0`), where the ratio is simply unknown.
-Don't hardcode 0.01: it is one employer's contract term, not a constant.
+`mutationLogs[]` contains the ordering person's **name**.
+
+The integration called this in 0.1.x for the conversion ratio and **no longer
+calls it at all** (0.2.0). The ratio was the wrong number (above), and this is
+the only endpoint in the API that returns a bank account number and a person's
+name for data nothing needed. Deriving the rate from `/api/articles` fixed the
+arithmetic and removed the PII-carrying request in the same change — the
+second being the larger win.
+
+If some future sensor genuinely needs order history, read only the fields it
+needs and never log the response.
 
 ### Endpoints seen in the SPA bundle but not needed here
 
@@ -260,10 +314,14 @@ calling.
 
 - **Domain is `trappers`.** Display name "Trappers" in `manifest.json`.
 - **`iot_class` is `cloud_polling`, `integration_type` is `service`.**
-- **Poll interval: 30 minutes by default.** This is an unofficial,
-  reverse-engineered API belonging to an employer benefits provider — be a
-  good citizen. Points change at most once per working day, so even hourly
-  would lose nothing.
+- **Poll interval: 1 hour by default** (was 30 minutes through 0.1.x). This is
+  an unofficial, reverse-engineered API belonging to an employer benefits
+  provider — be a good citizen. Points are credited at most once per working
+  day, when the collector unit reads the tag on arrival, so hourly still
+  surfaces the day's points within an hour of getting to the office. A cycle is
+  four requests (status, events, transactions, commute), so this is ~96
+  requests/day; the catalogue fetch behind the euro rate is cached 24h on top.
+  Going longer than an hour starts to feel stale for no further saving.
 - **Every request gets an explicit `aiohttp.ClientTimeout`** and
   `aiohttp.ClientError`/`asyncio.TimeoutError` must surface as `UpdateFailed`,
   never as an uncaught exception in the log.
@@ -289,10 +347,13 @@ calling.
 
 ## Design decisions made while building it
 
-Implemented and deployed 2026-09-07 (v0.1.0): seven sensors, verified
-end-to-end against the live account and read back off a real Home Assistant
-instance. The two API-contract corrections above came out of that work; these
-are the choices the code makes that the contract alone doesn't dictate.
+Implemented and deployed 2026-09-07: seven sensors, verified end-to-end
+against the live account and read back off a real Home Assistant instance.
+Shipped as 0.1.0, then 0.1.1 (entity IDs no longer carry the account's email
+address) and 0.2.0 (the euro sensor was overstating the balance by ~5%; poll
+interval relaxed to hourly). The API-contract corrections above came out of
+that work; these are the choices the code makes that the contract alone
+doesn't dictate.
 
 - **Sensor set.** `balance`, `balance_value_eur`, `cycling_days_total`,
   `cycling_days_this_month`, `last_cycling_day`, `points_earned_this_month`,
@@ -328,22 +389,32 @@ are the choices the code makes that the contract alone doesn't dictate.
 
 - **A poll is four requests, not one.** `/status` alone answers the headline
   balance, but the activity sensors need `/events`, `/transactions` and
-  `/commute` too. `/articleOrders` is the fifth and is deliberately *not* on
-  every cycle — see below. At a 30-minute interval that is ~200 requests a
-  day, which is still a gentle citizen for this API.
+  `/commute` too. At the hourly interval that is ~96 requests a day, plus the
+  once-daily `/articles` fetch behind the euro rate.
 
-- **`/articleOrders` is fetched at most once a day while the ratio is known,
-  and every poll while it is unknown.** That asymmetry is a privacy rule, not
-  a caching heuristic: the response for an account *with* orders is the one
-  carrying names and `ibanAccountNumber`, so it is pulled as rarely as the
-  data allows; the response for an account *without* orders is
-  `{"total": 0, "items": []}`, which carries nothing, so retrying it costs
-  nothing and picks up the first order promptly. `ORDER_RATIO_MAX_AGE` in
-  `api.py`.
+- **`balance_value_eur` is derived from the catalogue, as a mode.** See "The
+  trap" above for why not from `trapperToEuroConversionRatio`. The mechanics:
+  filter `/articles` to non-archived, publicly-available items, parse a face
+  value out of `articleName` (Dutch formatting — `"€ 1.000,00"` is a thousand),
+  compute `trappersPrice / face` per item and take the **mode**.
 
-- **`balance_value_eur` is `unknown`, never 0, on an account with no orders.**
-  The ratio only exists on order records. 0.01 is one employer's contract
-  term; defaulting to it would invent a number the API never returned.
+  The mode rather than the mean, deliberately. One mispriced or oddly-named
+  article shifts a mean and cannot shift a mode. More importantly, if the
+  catalogue ever stops being uniform, a mean produces a confident number that
+  buys nothing, whereas the mode fails its plurality check
+  (`MIN_MODE_SHARE`, `MIN_PRICED_ARTICLES`) and the sensor reads `unknown` —
+  which is the truth at that point. A catalogue with two rates means the
+  single-rate model is wrong, and that should surface, not average out.
+
+  A known rate is cached 24h (`POINTS_PER_EURO_MAX_AGE`); an unknown one is
+  not, so an unreadable catalogue resolves on the next poll rather than being
+  stuck for a day. Note the cache justification changed with the endpoint: for
+  `/articleOrders` it was a privacy rule, for `/articles` it is only about
+  traffic, since that response carries nothing personal.
+
+- **`balance_value_eur` is `unknown`, never 0 and never a guess**, when the
+  catalogue yields no usable rate. 105 is one employer's contract term exactly
+  as 0.01 was; defaulting to either would invent a number the API never gave.
 
 - **Month boundaries follow Home Assistant's clock, not the container's.**
   `api.py` is HA-independent and takes `today`/`now` as arguments;
@@ -353,8 +424,8 @@ are the choices the code makes that the contract alone doesn't dictate.
 
 - **Token handling is 401-driven re-login, not scheduled refresh.** The JWT
   lives four hours and `/api/security/token-refresh` exists, but a poll that
-  gets a 401 simply logs in again and retries once. At a 30-minute interval
-  that is one extra round-trip roughly every eighth poll, in exchange for no
+  gets a 401 simply logs in again and retries once. At the hourly interval
+  that is one extra round-trip roughly every fourth poll, in exchange for no
   expiry bookkeeping. A second 401 straight after a successful login raises
   `TrappersApiError`, not `TrappersAuthError` — re-entering the password
   cannot fix that, so routing it through reauth would be a dead end.
@@ -362,7 +433,7 @@ are the choices the code makes that the contract alone doesn't dictate.
 - **Paging is bounded, and hitting the bound is an error.** `/events` is
   fetched whole (needed for both the lifetime and the this-month count) at
   `limit=500`, capped at 20 pages; `/transactions` pages at 100 until a page
-  reaches into last month, capped at 12. The caps exist so a paging bug or a
+  reaches into last month, capped at 12; `/articles` at 400, capped at 10. The caps exist so a paging bug or a
   changed `total` becomes a clean `UpdateFailed` rather than an unbounded
   request loop against someone else's API.
 

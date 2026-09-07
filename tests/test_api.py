@@ -21,7 +21,8 @@ import aiohttp
 import pytest
 
 from custom_components.trappers.api import (
-    ARTICLE_ORDERS_URL,
+    ARTICLES_URL,
+    MIN_PRICED_ARTICLES,
     COMMUTE_URL,
     EVENTS_URL,
     LOGIN_URL,
@@ -158,13 +159,48 @@ DEFAULT_COMMUTE = [
     }
 ]
 
-DEFAULT_ORDER = {
-    "id": 1,
-    "orderNumber": "X-1",
-    "orderDate": "2026-03-26T10:04:39.451546",
-    "articleOrderStatus": "EXPORTED",
-    "trapperToEuroConversionRatio": 0.01,
-}
+def gift_card(face: str, price: object, **overrides: object) -> dict:
+    """A catalogue article whose face value is in its name, as gift cards are."""
+    numeric = price if isinstance(price, (int, float)) else 0.0
+    return {
+        "id": 1,
+        "articleName": f"bol. cadeaukaart {face}",
+        "trappersPrice": price,
+        # purchasePrice is trappersPrice x 0.01 by construction on the live API —
+        # which is exactly why trapperToEuroConversionRatio is not a spendable rate.
+        "purchasePrice": {"currency": "EUR", "amount": numeric * 0.01},
+        "salesPriceSupplier": {"currency": "EUR", "amount": numeric * 0.0089},
+        "availableInPublicShop": True,
+        "archived": False,
+        **overrides,
+    }
+
+
+def physical_good(name: str, price: float, **overrides: object) -> dict:
+    """A catalogue article with no face value in its name — a laptop, a watch."""
+    return {
+        "id": 2,
+        "articleName": name,
+        "trappersPrice": price,
+        "purchasePrice": {"currency": "EUR", "amount": price * 0.01},
+        "availableInPublicShop": True,
+        "archived": False,
+        **overrides,
+    }
+
+
+# The real catalogue is uniform: every priced article on the probed account
+# came out at exactly 105 points per euro of face value.
+DEFAULT_ARTICLES = [
+    gift_card("€ 25", 2625.0),
+    gift_card("€ 50", 5250.0),
+    gift_card("€ 100", 10500.0),
+    gift_card("€ 10", 1050.0),
+    gift_card("€ 20", 2100.0),
+    gift_card("€ 250", 26250.0),
+    physical_good("Apple Watch Series 11 - 42 mm", 48610.0),
+    physical_good("JBL Flip 7 - Zwart", 13209.0),
+]
 
 
 def responses(**overrides: list[FakeResponse]) -> dict[str, list[FakeResponse]]:
@@ -175,7 +211,7 @@ def responses(**overrides: list[FakeResponse]) -> dict[str, list[FakeResponse]]:
         EVENTS_URL: [page(DEFAULT_EVENTS)],
         TRANSACTIONS_URL: [page(DEFAULT_TRANSACTIONS, limit=100)],
         COMMUTE_URL: [page(DEFAULT_COMMUTE, limit=100)],
-        ARTICLE_ORDERS_URL: [page([DEFAULT_ORDER], total=6, limit=1)],
+        ARTICLES_URL: [page(DEFAULT_ARTICLES, limit=400)],
     }
     base.update(overrides)
     return base
@@ -281,7 +317,9 @@ class TestAsyncGetData:
             "cycling_days_this_month": 1,
             "points_earned_this_month": 154.0,
             "commute_distance": 11.0,
-            "balance_value_eur": 75.74,
+            # 7574 / 105 pt-per-euro. NOT 7574 * 0.01 — see
+            # test_euro_value_uses_the_shop_rate_not_the_accounting_ratio.
+            "balance_value_eur": 72.13,
         }
 
     async def test_duplicate_tag_reads_do_not_count_as_cycling_days(self) -> None:
@@ -402,55 +440,159 @@ class TestAsyncGetData:
 
         assert data["commute_distance"] is None
 
-    async def test_no_orders_means_euro_value_is_unknown_not_zero(self) -> None:
-        """The conversion ratio only exists on order records.
+    async def test_euro_value_uses_the_shop_rate_not_the_accounting_ratio(self) -> None:
+        """7574 points buy €72.13 of gift cards, not €75.74.
 
-        0.01 is one employer's contract term, not a property of the scheme —
-        defaulting to it would invent a number the API never gave us.
+        `/articleOrders`'s `trapperToEuroConversionRatio` (0.01) is the scheme's
+        internal cost basis — across the whole live catalogue,
+        `purchasePrice / trappersPrice` was exactly 0.01 for every article, so
+        it reproduces `purchasePrice` by construction. Valuing the balance with
+        it overstates it by the operator's margin. The rate that can actually be
+        spent is points per euro of *face* value: 2625 points for a €25 card.
         """
+        client, _session = make_client()
+
+        data = await client.async_get_data(today=TODAY, now=NOW)
+
+        # 7574 / 105, not 7574 * 0.01.
+        assert data["balance_value_eur"] == 72.13
+
+    async def test_articleorders_is_never_requested(self) -> None:
+        """It carries the ordering person's name and an ibanAccountNumber."""
+        client, session = make_client()
+
+        await client.async_get_data(today=TODAY, now=NOW)
+
+        assert not [c for c in session.calls if "articleOrder" in c[1]]
+
+    async def test_physical_goods_do_not_drag_the_rate_down(self) -> None:
+        """Goods run ~131 pt/€; the sensor should report the best rate, not a blend.
+
+        They have no face value in their name, so they never enter the
+        calculation at all — this pins that, since including them would both
+        understate the balance and be unfixable later without noticing.
+        """
+        articles = [
+            *[gift_card(f"€ {n}", n * 105.0) for n in (10, 20, 25, 50, 100)],
+            *[physical_good(f"Gadget {n}", n * 131.0) for n in range(1, 30)],
+        ]
         client, _session = make_client(
-            responses(**{ARTICLE_ORDERS_URL: [page([], limit=1)]})
+            responses(**{ARTICLES_URL: [page(articles, limit=400)]})
+        )
+
+        data = await client.async_get_data(today=TODAY, now=NOW)
+
+        assert data["balance_value_eur"] == 72.13
+
+    async def test_a_single_mispriced_article_cannot_move_the_rate(self) -> None:
+        """The mode survives an outlier; a mean would not."""
+        articles = [*DEFAULT_ARTICLES, gift_card("€ 25", 99999.0)]
+        client, _session = make_client(
+            responses(**{ARTICLES_URL: [page(articles, limit=400)]})
+        )
+
+        data = await client.async_get_data(today=TODAY, now=NOW)
+
+        assert data["balance_value_eur"] == 72.13
+
+    async def test_a_non_uniform_catalogue_is_unknown_not_an_average(self) -> None:
+        """Two rates means the single-rate model is wrong — say unknown.
+
+        An average here would be a confident number that buys nothing.
+        """
+        articles = [
+            *[gift_card(f"€ {n}", n * 105.0) for n in (10, 20, 25)],
+            *[gift_card(f"€ {n}", n * 140.0) for n in (50, 100, 250)],
+        ]
+        client, _session = make_client(
+            responses(**{ARTICLES_URL: [page(articles, limit=400)]})
         )
 
         data = await client.async_get_data(today=TODAY, now=NOW)
 
         assert data["balance_value_eur"] is None
 
-    async def test_known_ratio_is_reused_for_a_day(self) -> None:
-        """The orders response carries names and an IBAN — fetch it rarely."""
+    async def test_too_few_priced_articles_is_unknown(self) -> None:
+        client, _session = make_client(
+            responses(
+                **{
+                    ARTICLES_URL: [
+                        page(
+                            [gift_card("€ 25", 2625.0), gift_card("€ 50", 5250.0)],
+                            limit=400,
+                        )
+                    ]
+                }
+            )
+        )
+
+        data = await client.async_get_data(today=TODAY, now=NOW)
+
+        assert data["balance_value_eur"] is None
+
+    async def test_empty_catalogue_is_unknown(self) -> None:
+        client, _session = make_client(
+            responses(**{ARTICLES_URL: [page([], limit=400)]})
+        )
+
+        data = await client.async_get_data(today=TODAY, now=NOW)
+
+        assert data["balance_value_eur"] is None
+
+    async def test_archived_and_non_public_articles_are_excluded(self) -> None:
+        """A withdrawn article's old price must not set the rate."""
+        articles = [
+            *[gift_card(f"€ {n}", n * 105.0) for n in (10, 20, 25, 50, 100)],
+            *[gift_card(f"€ {n}", n * 200.0, archived=True) for n in (10, 20, 25, 50)],
+            *[
+                gift_card(f"€ {n}", n * 300.0, availableInPublicShop=False)
+                for n in (10, 20, 25, 50)
+            ],
+        ]
+        client, _session = make_client(
+            responses(**{ARTICLES_URL: [page(articles, limit=400)]})
+        )
+
+        data = await client.async_get_data(today=TODAY, now=NOW)
+
+        assert data["balance_value_eur"] == 72.13
+
+    async def test_known_rate_is_reused_for_a_day(self) -> None:
+        """It is a contract term; re-deriving it every poll re-fetches 99 articles."""
         client, session = make_client()
 
         await client.async_get_data(today=TODAY, now=NOW)
         await client.async_get_data(today=TODAY, now=NOW + timedelta(hours=1))
 
-        assert len([c for c in session.calls if c[1] == ARTICLE_ORDERS_URL]) == 1
+        assert len([c for c in session.calls if c[1] == ARTICLES_URL]) == 1
 
-    async def test_ratio_is_refetched_after_a_day(self) -> None:
+    async def test_rate_is_refetched_after_a_day(self) -> None:
         client, session = make_client()
 
         await client.async_get_data(today=TODAY, now=NOW)
         await client.async_get_data(today=TODAY, now=NOW + timedelta(hours=25))
 
-        assert len([c for c in session.calls if c[1] == ARTICLE_ORDERS_URL]) == 2
+        assert len([c for c in session.calls if c[1] == ARTICLES_URL]) == 2
 
-    async def test_unknown_ratio_is_retried_on_the_next_poll(self) -> None:
-        """`{"total": 0, "items": []}` carries no PII, so retrying costs nothing."""
+    async def test_unknown_rate_is_retried_on_the_next_poll(self) -> None:
+        """An unreadable catalogue must not stay unknown for a whole day."""
         client, session = make_client(
             responses(
                 **{
-                    ARTICLE_ORDERS_URL: [
-                        page([], limit=1),
-                        page([DEFAULT_ORDER], total=1, limit=1),
+                    ARTICLES_URL: [
+                        page([], limit=400),
+                        page(DEFAULT_ARTICLES, limit=400),
                     ]
                 }
             )
         )
 
         first = await client.async_get_data(today=TODAY, now=NOW)
-        second = await client.async_get_data(today=TODAY, now=NOW + timedelta(minutes=30))
+        second = await client.async_get_data(today=TODAY, now=NOW + timedelta(hours=1))
 
         assert first["balance_value_eur"] is None
-        assert second["balance_value_eur"] == 75.74
+        assert second["balance_value_eur"] == 72.13
+        assert len([c for c in session.calls if c[1] == ARTICLES_URL]) == 2
 
     async def test_no_cycling_days_at_all(self) -> None:
         client, _session = make_client(responses(**{EVENTS_URL: [page([])]}))
@@ -509,8 +651,8 @@ class TestTokenHandling:
             assert isinstance(kwargs["timeout"], aiohttp.ClientTimeout)
             assert kwargs["timeout"].total == 30
 
-    async def test_events_is_a_post_the_rest_are_gets(self) -> None:
-        """A GET on /events answers 405 — the method is load-bearing."""
+    async def test_events_and_articles_are_posts_the_rest_are_gets(self) -> None:
+        """A GET on /events or /articles answers 405 — the method is load-bearing."""
         client, session = make_client()
 
         await client.async_get_data(today=TODAY, now=NOW)
@@ -520,7 +662,7 @@ class TestTokenHandling:
         assert methods[STATUS_URL] == "GET"
         assert methods[TRANSACTIONS_URL] == "GET"
         assert methods[COMMUTE_URL] == "GET"
-        assert methods[ARTICLE_ORDERS_URL] == "GET"
+        assert methods[ARTICLES_URL] == "POST"
 
 
 class TestMalformedResponses:
@@ -594,18 +736,14 @@ class TestMalformedResponses:
                 id="commute-unparseable-date",
             ),
             pytest.param(
-                ARTICLE_ORDERS_URL,
-                {
-                    "items": [{"trapperToEuroConversionRatio": "one percent"}],
-                    "total": 1,
-                    "offset": 0,
-                },
-                id="orders-ratio-not-a-number",
+                ARTICLES_URL,
+                {"items": ["nope"], "total": 1, "offset": 0},
+                id="articles-item-not-an-object",
             ),
             pytest.param(
-                ARTICLE_ORDERS_URL,
-                {"items": ["nope"], "total": 1, "offset": 0},
-                id="orders-item-not-an-object",
+                ARTICLES_URL,
+                {"limit": 400, "offset": 0},
+                id="articles-no-items",
             ),
         ],
     )
@@ -639,17 +777,20 @@ class TestMalformedResponses:
 
         assert data["commute_distance"] is None
 
-    async def test_order_without_a_ratio_is_unknown_not_an_error(self) -> None:
+    async def test_articles_with_unusable_prices_are_unknown_not_an_error(self) -> None:
+        """A catalogue this client can't read a rate from is a missing value."""
         client, _session = make_client(
             responses(
                 **{
-                    ARTICLE_ORDERS_URL: [
-                        FakeResponse(
-                            json_data={
-                                "items": [{"orderNumber": "X-1"}],
-                                "total": 1,
-                                "offset": 0,
-                            }
+                    ARTICLES_URL: [
+                        page(
+                            [
+                                gift_card("€ 25", "twenty-six-twenty-five"),
+                                gift_card("€ 0", 2625.0),
+                                {"articleName": "bol. cadeaukaart € 25"},
+                                gift_card("€ 50", -1.0),
+                            ],
+                            limit=400,
                         )
                     ]
                 }
@@ -659,3 +800,44 @@ class TestMalformedResponses:
         data = await client.async_get_data(today=TODAY, now=NOW)
 
         assert data["balance_value_eur"] is None
+
+
+class TestFaceValueParsing:
+    """Article names carry Dutch number formatting, so "1.000,00" is a thousand."""
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            pytest.param("bol. cadeaukaart € 25", 25.0, id="plain"),
+            pytest.param("VVV Cadeaukaart € 100", 100.0, id="hundred"),
+            pytest.param("Cadeaukaart €50", 50.0, id="no-space"),
+            pytest.param("Cadeaukaart € 12,50", 12.5, id="decimal-comma"),
+            pytest.param("Cadeaukaart € 1.000,00", 1000.0, id="dutch-thousands"),
+            pytest.param("Cadeaukaart € 1.000", 1000.0, id="thousands-no-decimals"),
+            pytest.param("Cadeaukaart € 25.", 25.0, id="trailing-punctuation"),
+            pytest.param("Cadeaukaart t.w.v. € 75 (digitaal)", 75.0, id="mid-name"),
+        ],
+    )
+    def test_face_values_parsed(self, name: str, expected: float) -> None:
+        assert TrappersApiClient._parse_face_value(name) == expected
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            pytest.param("Apple Watch Series 11 - 42 mm", id="physical-good"),
+            pytest.param("JBL Flip 7 - Zwart", id="no-currency"),
+            pytest.param("Cadeaukaart € 0", id="zero"),
+            pytest.param("Cadeaukaart € ..", id="unparseable"),
+            pytest.param("", id="empty"),
+            pytest.param(None, id="not-a-string"),
+            pytest.param(12345, id="a-number"),
+        ],
+    )
+    def test_names_without_a_usable_face_value(self, name: object) -> None:
+        assert TrappersApiClient._parse_face_value(name) is None
+
+    def test_thousands_separator_is_not_read_as_a_decimal(self) -> None:
+        """"€ 1.000" must be a thousand euros, not one — a 1000x rate error."""
+        articles = [gift_card("€ 1.000", 105000.0) for _ in range(MIN_PRICED_ARTICLES)]
+
+        assert TrappersApiClient._derive_points_per_euro(articles) == 105.0

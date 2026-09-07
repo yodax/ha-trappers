@@ -39,17 +39,27 @@ Endpoints used here
 ``GET /commute``
     Paged. ``distance`` is the **one-way** commute in metres.
 
-``GET /articleOrders?limit&offset``
-    Paged. The only place ``trapperToEuroConversionRatio`` appears — but the
-    same response also carries the ordering person's name in ``mutationLogs``
-    and an ``ibanAccountNumber`` field. Only the ratio and the order date are
-    ever read out of it, and it is fetched at most once a day (see
-    ``ORDER_RATIO_MAX_AGE``) rather than on every poll cycle.
+``POST /articles?limit&offset``
+    POST, not GET (a GET answers 405); body ``{}``. Paged. The webshop
+    catalogue, and the only honest source of what the balance is actually
+    worth — see ``_async_get_points_per_euro`` for why, and why
+    ``/articleOrders``'s ``trapperToEuroConversionRatio`` is not it. Carries
+    no personal data at all, which is the other reason to prefer it.
+
+Deliberately not used
+---------------------
+
+``GET /articleOrders`` was read in 0.1.x for its
+``trapperToEuroConversionRatio`` and is no longer called at all. The ratio
+turned out to be the scheme's internal cost basis rather than a spendable
+rate (see below), and that response is the one carrying the ordering person's
+name and an ``ibanAccountNumber`` field — so dropping it removes both a wrong
+number and the only endpoint here that returned personal data nothing wanted.
 
 Privacy
 -------
 
-Every one of these responses carries the account holder's home address,
+The account endpoints above carry the account holder's home address,
 telephone number and employer employee numbers alongside the two or three
 numbers the sensors want. Nothing in this module logs a response body, a
 token, a password or any identity field — debug logging is endpoint + status
@@ -58,6 +68,8 @@ code only.
 from __future__ import annotations
 
 import logging
+import re
+from collections import Counter
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -71,7 +83,7 @@ STATUS_URL = f"{API_BASE}/status"
 EVENTS_URL = f"{API_BASE}/events"
 TRANSACTIONS_URL = f"{API_BASE}/transactions"
 COMMUTE_URL = f"{API_BASE}/commute"
-ARTICLE_ORDERS_URL = f"{API_BASE}/articleOrders"
+ARTICLES_URL = f"{API_BASE}/articles"
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
@@ -96,14 +108,34 @@ MAX_EVENT_PAGES = 20
 TRANSACTIONS_PAGE_LIMIT = 100
 MAX_TRANSACTION_PAGES = 12
 
-# How long a known points→euro conversion ratio is reused before re-reading it.
-# It is a contract term between the employer and FiscFree, so it effectively
-# never changes; the reason to cache it is that its response is the one that
-# carries names and an IBAN. An *unknown* ratio (an account with no orders yet)
-# is deliberately not cached — that response is `{"total": 0, "items": []}`,
-# which carries nothing at all, so retrying it every poll costs no privacy and
-# picks up the account's first order promptly.
-ORDER_RATIO_MAX_AGE = timedelta(hours=24)
+# The webshop catalogue, from which the points→euro rate is derived. One page
+# covers it comfortably — 99 articles on the probed account — but it is paged
+# properly anyway.
+ARTICLES_PAGE_LIMIT = 400
+MAX_ARTICLE_PAGES = 10
+
+# A gift card's face value, as it appears in the article name: "bol. cadeaukaart
+# € 25", "VVV Cadeaukaart € 100". Dutch number formatting, so "1.000,00" is a
+# thousand euros, not one.
+FACE_VALUE_RE = re.compile(r"€\s*([\d.,]+)")
+
+# Guards on deriving a single rate from the catalogue. The probed account gave
+# 59 priced articles at *exactly* one rate, so these thresholds are nowhere near
+# binding — they exist so that a catalogue which stops being uniform produces an
+# honest "unknown" instead of a confident average of a bimodal distribution. A
+# catalogue with two rates means the single-rate model is wrong, and that is
+# worth surfacing as an unknown rather than papering over.
+MIN_PRICED_ARTICLES = 5
+MIN_MODE_SHARE = 0.6
+
+# How long a derived rate is reused. It is a term of the employer's contract
+# with FiscFree, so it effectively never changes; re-deriving it every poll
+# would just re-fetch a hundred-article catalogue for the same answer. Unlike
+# the /articleOrders response this replaced, /articles carries no personal data,
+# so the cache here is about traffic, not privacy. An *unknown* rate is not
+# cached, so a catalogue that becomes readable again is picked up on the next
+# poll.
+POINTS_PER_EURO_MAX_AGE = timedelta(hours=24)
 
 
 class TrappersAuthError(Exception):
@@ -129,8 +161,8 @@ class TrappersApiClient:
         self._email = email
         self._password = password
         self._token: str | None = None
-        self._euro_ratio: float | None = None
-        self._euro_ratio_fetched: datetime | None = None
+        self._points_per_euro: float | None = None
+        self._points_per_euro_fetched: datetime | None = None
 
     # ── authentication ────────────────────────────────────────────────────
 
@@ -140,8 +172,8 @@ class TrappersApiClient:
         The token is valid for four hours. Rather than tracking its expiry,
         this client re-logs-in when a request comes back 401 (see
         ``_async_request``) — one fewer moving part than a scheduled refresh,
-        and at a 30-minute poll interval it costs one extra round-trip roughly
-        every eighth poll.
+        and at an hourly poll interval it costs one extra round-trip roughly
+        every fourth poll.
 
         The login response's ``userDetails`` object carries the whole account
         holder — name, address, telephone number, employer employee numbers.
@@ -394,47 +426,123 @@ class TrappersApiClient:
             )
         return int(distance)
 
-    async def _async_get_euro_ratio(self, now: datetime) -> float | None:
-        """Points→euro conversion ratio from the newest order, or None if unknown.
+    @staticmethod
+    def _parse_face_value(article_name: object) -> float | None:
+        """Euro face value out of an article name, or None if it has none.
 
-        Genuinely unknown for an account that has never ordered anything: the
-        ratio only exists on order records. It is *not* defaulted to a constant
-        — the 0.01 seen on one probed account is that employer's contract term,
-        not a property of the scheme.
+        Gift cards carry their face value in the name ("bol. cadeaukaart € 25").
+        Physical goods do not — a laptop's retail value is nowhere in the
+        response — so those simply return None and take no part in the rate.
+        """
+        if not isinstance(article_name, str):
+            return None
+        match = FACE_VALUE_RE.search(article_name)
+        if not match:
+            return None
 
-        Only the ratio is read out of this response. The rest of it carries the
-        ordering person's name and an IBAN, which is also why a known ratio is
-        reused for a day instead of re-fetched every poll.
+        raw = match.group(1).strip(".,")
+        if "," in raw:
+            # Dutch decimal comma: "1.000,00" is a thousand euros.
+            raw = raw.replace(".", "").replace(",", ".")
+        elif raw.count(".") == 1 and len(raw.rsplit(".", 1)[1]) == 3:
+            # "1.000" with no comma is also a thousands separator, not a decimal.
+            raw = raw.replace(".", "")
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    @classmethod
+    def _derive_points_per_euro(cls, items: list[Any]) -> float | None:
+        """Points charged per euro of face value, as the mode across the catalogue.
+
+        **The mode, not the mean.** A single mispriced or oddly-named article
+        shifts a mean and cannot shift a mode. And if the catalogue genuinely
+        stops being uniform, a mean would quietly report a number that buys
+        nothing, whereas a mode that fails its plurality check returns None and
+        the sensor says `unknown` — which is the truth at that point.
+
+        Returns None rather than raising: a catalogue this client cannot read a
+        rate from is a missing value, not a broken integration.
+        """
+        rates: list[float] = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise TrappersApiError("Unexpected articles response: item is not an object")
+            if item.get("archived") or not item.get("availableInPublicShop"):
+                continue
+            face_value = cls._parse_face_value(item.get("articleName"))
+            if face_value is None:
+                continue
+            price = item.get("trappersPrice")
+            if not isinstance(price, (int, float)) or price <= 0:
+                continue
+            # Rounded before counting so float noise can't split the mode.
+            rates.append(round(price / face_value, 2))
+
+        if len(rates) < MIN_PRICED_ARTICLES:
+            return None
+        rate, count = Counter(rates).most_common(1)[0]
+        if count / len(rates) < MIN_MODE_SHARE:
+            _LOGGER.debug(
+                "Catalogue rate is not uniform (%s of %s articles at the mode) — "
+                "reporting the balance's euro value as unknown",
+                count,
+                len(rates),
+            )
+            return None
+        return rate
+
+    async def _async_get_points_per_euro(self, now: datetime) -> float | None:
+        """How many points one euro of spendable value costs, or None if unknown.
+
+        Derived from the webshop catalogue, **not** from
+        ``/articleOrders``'s ``trapperToEuroConversionRatio``. That field is
+        real, but it is the scheme's internal cost basis, not a rate anything
+        can be bought at: across all 99 catalogue articles on the probed
+        account, ``purchasePrice / trappersPrice`` was exactly 0.01 for every
+        single one — the ratio simply reproduces ``purchasePrice`` by
+        construction. Valuing the balance with it overstates it by the
+        operator's margin: 7574 points came out as €75.74, while the same 7574
+        points buy €72.13 of gift cards in the actual shop.
+
+        The rate that can be spent is ``trappersPrice`` per euro of **face**
+        value: a "bol. cadeaukaart € 25" costs 2625 points, so 105 points per
+        euro. That was uniform across all 59 priced articles on the probed
+        account.
+
+        Gift cards are also the *best* rate available. Physical goods run
+        around 131 points/€ against their supplier price, so reporting the
+        gift-card rate is reporting the best achievable value of the balance —
+        which is the right thing for the sensor to claim. Averaging the goods
+        in would understate what the balance is worth.
+
+        105 is this employer's contract term, exactly as 0.01 was, and is never
+        hardcoded.
         """
         if (
-            self._euro_ratio is not None
-            and self._euro_ratio_fetched is not None
-            and now - self._euro_ratio_fetched < ORDER_RATIO_MAX_AGE
+            self._points_per_euro is not None
+            and self._points_per_euro_fetched is not None
+            and now - self._points_per_euro_fetched < POINTS_PER_EURO_MAX_AGE
         ):
-            return self._euro_ratio
+            return self._points_per_euro
 
-        payload = await self._async_request(
-            "GET", ARTICLE_ORDERS_URL, params={"limit": 1, "offset": 0}
+        items = await self._async_fetch_all(
+            "POST",
+            ARTICLES_URL,
+            "articles",
+            page_limit=ARTICLES_PAGE_LIMIT,
+            max_pages=MAX_ARTICLE_PAGES,
         )
-        items, _total = self._validate_page(payload, "articleOrders")
-        if not items:
-            # No orders yet — the ratio is unknown, not zero.
+        rate = self._derive_points_per_euro(items)
+        if rate is None:
+            # Not cached: an unreadable catalogue should resolve on the next
+            # poll rather than stay unknown for a day.
             return None
-        newest = items[0]
-        if not isinstance(newest, dict):
-            raise TrappersApiError(
-                "Unexpected articleOrders response: item is not an object"
-            )
-        ratio = newest.get("trapperToEuroConversionRatio")
-        if ratio is None:
-            return None
-        if not isinstance(ratio, (int, float)):
-            raise TrappersApiError(
-                "Unexpected articleOrders response: conversion ratio is not numeric"
-            )
-        self._euro_ratio = float(ratio)
-        self._euro_ratio_fetched = now
-        return self._euro_ratio
+        self._points_per_euro = rate
+        self._points_per_euro_fetched = now
+        return rate
 
     # ── the one call the coordinator makes ────────────────────────────────
 
@@ -461,9 +569,11 @@ class TrappersApiClient:
             data["commute_distance"] = (
                 round(distance_m / 1000, 2) if distance_m is not None else None
             )
-            ratio = await self._async_get_euro_ratio(now)
+            points_per_euro = await self._async_get_points_per_euro(now)
             data["balance_value_eur"] = (
-                round(data["balance"] * ratio, 2) if ratio is not None else None
+                round(data["balance"] / points_per_euro, 2)
+                if points_per_euro
+                else None
             )
         except TrappersApiError:
             raise

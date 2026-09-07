@@ -50,7 +50,7 @@ Home Assistant language (English and Dutch ship with the integration).
 | Sensor | Unit | Description |
 |---|---|---|
 | Points balance | trappers | Your current points balance — the headline number. |
-| Points balance value | € | The balance converted to euros. `unknown` until the account has placed at least one order (see below). |
+| Points balance value | € | What the balance is worth in the webshop, at the gift-card rate (see below). |
 | Cycling days total | — | Cycling days registered since you joined the scheme. |
 | Cycling days this month | — | Cycling days in the current calendar month. Resets on the 1st. |
 | Last cycling day | date | The most recent day a collector unit registered your bike. |
@@ -65,27 +65,51 @@ a duplicate, which earns no points — so the raw entry count runs ahead of the
 number of days you actually cycled. Both cycling-day sensors count distinct,
 non-duplicate days, which is the figure that matches the points you were paid.
 
-**The euro value needs an order to exist.** The points-to-euro rate is part of
-the contract between your employer and FiscFree, and the API only reveals it on
-an order record. On an account that has never ordered anything there is no rate
-to read, so "Points balance value" stays `unknown` rather than showing a made-up
-number. It fills in by itself after your first order.
+**The euro value is what you can actually spend, not the scheme's cost
+basis.** The API does have a field called `trapperToEuroConversionRatio`, and it
+is tempting, but it is not the rate you can buy at — it reproduces the scheme's
+own purchase price, which sits above shop prices by the operator's margin. Using
+it overstated the balance by about 5%.
+
+"Points balance value" instead reads the webshop catalogue and works out what
+the points buy: a "bol. cadeaukaart € 25" costing 2625 points is 105 points per
+euro, so a balance of 7574 points is worth € 72,13. The rate is read from your
+own employer's catalogue, never assumed — it is a contract term and it differs
+between employers.
+
+Gift cards are deliberately the yardstick, because they are the *best* rate in
+the shop: physical goods (headphones, smartwatches) run around 131 points per
+euro of their supplier price. So this sensor reports the best achievable value
+of your balance. Please don't "fix" it by averaging the physical goods in —
+that would understate what the balance is worth.
+
+If the catalogue ever stops having one consistent rate, the sensor reads
+`unknown` rather than reporting an average that would buy nothing.
 
 ## Polling
 
-Each account polls on a **30-minute interval** by default. This is a
-deliberately conservative default for an unofficial API belonging to an
-employer benefits provider; points change at most once per working day, so
-nothing is lost by polling gently. Trigger an immediate refresh from
-**Developer tools → Actions → `homeassistant.update_entity`** or the reload
-button on the integration's entry.
+Each account polls **once an hour**. That is a deliberately conservative
+default for an unofficial API belonging to an employer benefits provider, and
+nothing is lost by it: points are credited at most once per working day, when
+the collector unit reads your bike tag as you arrive, so the day's points show
+up within an hour of you getting there.
+
+A poll is four requests (balance, cycling days, transactions, commute). The
+webshop catalogue behind the euro value is read at most once a day on top of
+that, since the rate is a contract term that does not move.
+
+Trigger an immediate refresh from **Developer tools → Actions →
+`homeassistant.update_entity`** or the reload button on the integration's
+entry.
 
 ## Privacy
 
 The Trappers API returns a lot more than points: your home address, telephone
 number and employer employee numbers all come back on every call. This
-integration **only exposes the numbers it needs** and never logs the rest —
-see the "Privacy" and "Design constraints" sections of
+integration **only exposes the numbers it needs** and never logs the rest. It
+also does not call the orders endpoint at all — that is the one that returns
+the ordering person's name and a bank account number, and nothing here needs
+it. See the "Privacy" and "Design constraints" sections of
 [`CLAUDE.md`](CLAUDE.md). Nothing account-specific is committed to this
 repository, and a pre-commit hook (`.githooks/pre-commit`) enforces that.
 
