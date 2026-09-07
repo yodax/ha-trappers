@@ -1,0 +1,54 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Trappers-account toevoegen",
+        "description": "Voeg de inloggegevens toe voor één Trappers-account — hetzelfde e-mailadres en wachtwoord als op trappersshop.fiscfree.nl. Voeg deze integratie nogmaals toe om een tweede account te volgen.",
+        "data": {
+          "email": "E-mailadres",
+          "password": "Wachtwoord"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Trappers opnieuw verifiëren",
+        "description": "Het wachtwoord voor {email} werkt niet meer. Voer het huidige wachtwoord in om dit account opnieuw te verbinden.",
+        "data": {
+          "password": "Wachtwoord"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Ongeldig e-mailadres of wachtwoord.",
+      "unknown": "Onverwachte fout."
+    },
+    "abort": {
+      "already_configured": "Dit account is al geconfigureerd.",
+      "reauth_successful": "Opnieuw verifiëren is gelukt."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "balance": {
+        "name": "Puntensaldo"
+      },
+      "balance_value_eur": {
+        "name": "Waarde puntensaldo"
+      },
+      "cycling_days_total": {
+        "name": "Fietsdagen totaal"
+      },
+      "cycling_days_this_month": {
+        "name": "Fietsdagen deze maand"
+      },
+      "last_cycling_day": {
+        "name": "Laatste fietsdag"
+      },
+      "points_earned_this_month": {
+        "name": "Punten verdiend deze maand"
+      },
+      "commute_distance": {
+        "name": "Woon-werkafstand"
+      }
+    }
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add a Trappers account",
+        "description": "Add the credentials for one Trappers account — the same email address and password you use on trappersshop.fiscfree.nl. Add this integration again to track a second account.",
+        "data": {
+          "email": "Email address",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Trappers",
+        "description": "The password for {email} no longer works. Enter the current password to reconnect this account.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email address or password.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Re-authentication was successful."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "balance": {
+        "name": "Points balance"
+      },
+      "balance_value_eur": {
+        "name": "Points balance value"
+      },
+      "cycling_days_total": {
+        "name": "Cycling days total"
+      },
+      "cycling_days_this_month": {
+        "name": "Cycling days this month"
+      },
+      "last_cycling_day": {
+        "name": "Last cycling day"
+      },
+      "points_earned_this_month": {
+        "name": "Points earned this month"
+      },
+      "commute_distance": {
+        "name": "Commute distance"
+      }
+    }
+  }
+}
