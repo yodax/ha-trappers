@@ -134,14 +134,21 @@ class TrappersApiClient:
 
     # ── authentication ────────────────────────────────────────────────────
 
-    async def async_login(self) -> None:
-        """Authenticate and store a bearer token for subsequent requests.
+    async def async_login(self) -> str | None:
+        """Authenticate, store a bearer token, and return the account's first name.
 
         The token is valid for four hours. Rather than tracking its expiry,
         this client re-logs-in when a request comes back 401 (see
         ``_async_request``) — one fewer moving part than a scheduled refresh,
         and at a 30-minute poll interval it costs one extra round-trip roughly
         every eighth poll.
+
+        The login response's ``userDetails`` object carries the whole account
+        holder — name, address, telephone number, employer employee numbers.
+        Exactly one field is returned from it: ``firstName``, which the config
+        flow uses to title the entry. Returning the object wholesale would put
+        the rest of it in reach of every caller for no reason, so it does not
+        leave this method. ``None`` when the account has no first name set.
         """
         async with self._session.post(
             LOGIN_URL,
@@ -157,10 +164,16 @@ class TrappersApiClient:
             resp.raise_for_status()
             data = await resp.json()
 
-        token = data.get("token") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            raise TrappersApiError("Login response was not an object")
+        token = data.get("token")
         if not token:
             raise TrappersApiError("Login response carried no token")
         self._token = token
+
+        details = data.get("userDetails")
+        first_name = details.get("firstName") if isinstance(details, dict) else None
+        return first_name if isinstance(first_name, str) else None
 
     async def _async_request(
         self, method: str, url: str, *, params: dict[str, int] | None = None

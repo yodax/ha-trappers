@@ -299,6 +299,33 @@ are the choices the code makes that the contract alone doesn't dictate.
   `commute_distance`. All seven are supported honestly — none had to be
   dropped.
 
+- **The config entry is titled from `firstName`, never the email address**
+  (fixed in 0.1.1; 0.1.0 shipped `title=email` and was wrong). HA slugifies the
+  entry title into the device name and from there into every entity_id, so
+  `title=email` produced `sensor.you_example_com_puntensaldo` — the user's whole
+  address, local part and employer domain both — and a friendly_name to match. That is not merely ugly: entity_ids travel into
+  dashboard YAML pasted into forum threads and issues on this repo, and into
+  any screenshot committed under `docs/screenshots/` — so it would make
+  redacting an address a chore the user has to remember every single time.
+  `_entry_title()` in `config_flow.py` uses the account's first name, falling
+  back to the address's **local part** (never the whole address — the domain is
+  what identifies an employer) and then to "Trappers". `firstName` is the only
+  field taken out of the login response's `userDetails`; `async_login()` returns
+  that one string rather than the object, so the address, telephone number and
+  employee numbers alongside it never reach a caller.
+
+  `unique_id` remains the full lowercased email. It is the duplicate-account
+  guard and it is never rendered anywhere.
+
+  Two tests pin this: `test_entry_title_never_contains_the_email_address` and
+  `test_nothing_user_visible_carries_the_account_email`, the latter sweeping
+  every entity_id, every state attribute and every DeviceInfo field — so a
+  future "simplification" back to `title=email`, or an address quietly added to
+  `model`/`sw_version`, fails instead of silently re-leaking.
+
+  **Note `ha-50plusmobiel` has the same `title=username` line and has not been
+  changed** — different repo, deliberately left for its owner to decide.
+
 - **A poll is four requests, not one.** `/status` alone answers the headline
   balance, but the activity sensors need `/events`, `/transactions` and
   `/commute` too. `/articleOrders` is the fifth and is deliberately *not* on

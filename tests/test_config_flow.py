@@ -1,6 +1,7 @@
 """Tests for the trappers config flow, including the reauth flow."""
 from __future__ import annotations
 
+import pytest
 from unittest.mock import AsyncMock, patch
 
 from homeassistant import config_entries
@@ -18,7 +19,7 @@ LOGIN_PATCH_TARGET = "custom_components.trappers.api.TrappersApiClient.async_log
 
 
 async def test_user_step_success_creates_entry(hass: HomeAssistant) -> None:
-    with patch(LOGIN_PATCH_TARGET, new=AsyncMock(return_value=None)):
+    with patch(LOGIN_PATCH_TARGET, new=AsyncMock(return_value="Alex")):
         result = await hass.config_entries.flow.async_init(
             DOMAIN, context={"source": config_entries.SOURCE_USER}
         )
@@ -27,7 +28,7 @@ async def test_user_step_success_creates_entry(hass: HomeAssistant) -> None:
         )
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["title"] == EMAIL
+    assert result["title"] == "Alex"
     assert result["data"] == {CONF_EMAIL: EMAIL, CONF_PASSWORD: PASSWORD}
 
 
@@ -59,7 +60,7 @@ async def test_a_second_account_gets_its_own_entry(hass: HomeAssistant) -> None:
         data={CONF_EMAIL: EMAIL, CONF_PASSWORD: PASSWORD},
     ).add_to_hass(hass)
 
-    with patch(LOGIN_PATCH_TARGET, new=AsyncMock(return_value=None)):
+    with patch(LOGIN_PATCH_TARGET, new=AsyncMock(return_value="Sam")):
         result = await hass.config_entries.flow.async_init(
             DOMAIN, context={"source": config_entries.SOURCE_USER}
         )
@@ -69,7 +70,8 @@ async def test_a_second_account_gets_its_own_entry(hass: HomeAssistant) -> None:
         )
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["title"] == "other@example.com"
+    assert result["title"] == "Sam"
+    assert len(hass.config_entries.async_entries(DOMAIN)) == 2
 
 
 async def test_user_step_invalid_auth_shows_error(hass: HomeAssistant) -> None:
@@ -147,3 +149,76 @@ async def test_reauth_flow_invalid_auth_shows_error(hass: HomeAssistant) -> None
     assert result["errors"] == {"base": "invalid_auth"}
     # The password isn't updated on a failed reauth attempt.
     assert entry.data[CONF_PASSWORD] == "old-password"
+
+
+async def test_entry_title_never_contains_the_email_address(hass: HomeAssistant) -> None:
+    """The entry title is slugified into every entity_id, so it must not be the email.
+
+    `title=email` puts the account holder's address into
+    `sensor.<address>_puntensaldo` and into every friendly_name — which then
+    travels into any dashboard YAML pasted into a forum thread or an issue on
+    this repo, and into any screenshot. `unique_id` stays the lowercased email
+    (it is never rendered); the title is a display name, and it is derived from
+    the account's first name instead.
+    """
+    with patch(LOGIN_PATCH_TARGET, new=AsyncMock(return_value="Alex")):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_EMAIL: EMAIL, CONF_PASSWORD: PASSWORD}
+        )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    title = result["title"]
+    assert EMAIL not in title
+    assert "@" not in title
+    assert "example.com" not in title
+    # The credentials are still stored on the entry — only the display name changes.
+    assert result["data"] == {CONF_EMAIL: EMAIL, CONF_PASSWORD: PASSWORD}
+
+
+async def test_entry_title_is_the_account_first_name(hass: HomeAssistant) -> None:
+    """A household with two accounts gets 'Alex' and 'Sam', not two addresses."""
+    with patch(LOGIN_PATCH_TARGET, new=AsyncMock(return_value="Alex")):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_EMAIL: EMAIL, CONF_PASSWORD: PASSWORD}
+        )
+
+    assert result["title"] == "Alex"
+
+
+@pytest.mark.parametrize(
+    "first_name", [None, "", "   "], ids=["missing", "empty", "whitespace"]
+)
+async def test_title_falls_back_to_the_local_part_not_the_full_address(
+    hass: HomeAssistant, first_name: str | None
+) -> None:
+    """No usable first name still must not put the domain into entity_ids."""
+    with patch(LOGIN_PATCH_TARGET, new=AsyncMock(return_value=first_name)):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_EMAIL: EMAIL, CONF_PASSWORD: PASSWORD}
+        )
+
+    assert result["title"] == "user"
+    assert "@" not in result["title"]
+
+
+async def test_unique_id_is_still_the_full_lowercased_email(hass: HomeAssistant) -> None:
+    """Changing the title must not weaken the duplicate-account guard."""
+    with patch(LOGIN_PATCH_TARGET, new=AsyncMock(return_value="Alex")):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_EMAIL: "User@Example.COM", CONF_PASSWORD: PASSWORD}
+        )
+
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+    assert entry.unique_id == EMAIL

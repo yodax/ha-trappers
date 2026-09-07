@@ -86,10 +86,15 @@ class FakeSession:
         return self._take("POST", url, kwargs)
 
 
-def login_ok(token: str = "jwt-1") -> FakeResponse:
-    # userDetails is deliberately trimmed to the one field this client reads;
-    # the live response also carries name/address/phone/employee numbers.
-    return FakeResponse(json_data={"token": token, "userDetails": {"balance": 7574.0}})
+def login_ok(token: str = "jwt-1", first_name: object = "Alex") -> FakeResponse:
+    # userDetails is deliberately trimmed to the two fields this client touches;
+    # the live response also carries surname, address, phone and employee numbers.
+    return FakeResponse(
+        json_data={
+            "token": token,
+            "userDetails": {"balance": 7574.0, "firstName": first_name},
+        }
+    )
 
 
 def page(items: list, total: int | None = None, limit: int = 500) -> FakeResponse:
@@ -184,13 +189,35 @@ def make_client(
 
 
 class TestAsyncLogin:
-    async def test_happy_path_stores_token(self) -> None:
+    async def test_happy_path_stores_token_and_returns_the_first_name(self) -> None:
         client, session = make_client()
 
-        await client.async_login()
+        first_name = await client.async_login()
 
         assert client._token == "jwt-1"
+        assert first_name == "Alex"
         assert session.calls[0][1] == LOGIN_URL
+
+    @pytest.mark.parametrize(
+        "first_name",
+        [None, 12345, {"nested": "thing"}],
+        ids=["null", "not-a-string", "an-object"],
+    )
+    async def test_missing_or_odd_first_name_is_just_none(self, first_name: object) -> None:
+        """The title falls back elsewhere; a weird firstName must not break login."""
+        client, _session = make_client(
+            responses(**{LOGIN_URL: [login_ok(first_name=first_name)]})
+        )
+
+        assert await client.async_login() is None
+
+    async def test_login_response_that_is_not_an_object_raises_api_error(self) -> None:
+        client, _session = make_client(
+            responses(**{LOGIN_URL: [FakeResponse(json_data=["surprise"])]})
+        )
+
+        with pytest.raises(TrappersApiError, match="not an object"):
+            await client.async_login()
 
     async def test_rejected_credentials_are_a_400_not_a_401(self) -> None:
         """The login endpoint answers 400 for bad credentials — not 401.

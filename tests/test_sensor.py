@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.typing import UNDEFINED
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -14,6 +15,7 @@ from custom_components.trappers.const import CONF_EMAIL, CONF_PASSWORD, DOMAIN
 from custom_components.trappers.sensor import SENSOR_DESCRIPTIONS
 
 EMAIL = "user@example.com"
+ACCOUNT_NAME = "Alex"
 COMPONENT_DIR = Path(__file__).parent.parent / "custom_components" / "trappers"
 
 SAMPLE_DATA = {
@@ -30,7 +32,7 @@ SAMPLE_DATA = {
 async def _setup_entry(hass: HomeAssistant, data: dict) -> MockConfigEntry:
     entry = MockConfigEntry(
         domain=DOMAIN,
-        title=EMAIL,
+        title=ACCOUNT_NAME,
         unique_id=EMAIL,
         data={CONF_EMAIL: EMAIL, CONF_PASSWORD: "hunter2"},
     )
@@ -53,13 +55,13 @@ async def test_all_sensors_are_created_with_their_values(hass: HomeAssistant) ->
         for state in hass.states.async_all("sensor")
     }
     assert states == {
-        "sensor.user_example_com_points_balance": "7574.0",
-        "sensor.user_example_com_points_balance_value": "75.74",
-        "sensor.user_example_com_cycling_days_total": "131",
-        "sensor.user_example_com_cycling_days_this_month": "1",
-        "sensor.user_example_com_last_cycling_day": "2026-09-01",
-        "sensor.user_example_com_points_earned_this_month": "154.0",
-        "sensor.user_example_com_commute_distance": "11.0",
+        "sensor.alex_points_balance": "7574.0",
+        "sensor.alex_points_balance_value": "75.74",
+        "sensor.alex_cycling_days_total": "131",
+        "sensor.alex_cycling_days_this_month": "1",
+        "sensor.alex_last_cycling_day": "2026-09-01",
+        "sensor.alex_points_earned_this_month": "154.0",
+        "sensor.alex_commute_distance": "11.0",
     }
 
 
@@ -69,8 +71,8 @@ async def test_unknown_values_read_as_unknown_not_zero(hass: HomeAssistant) -> N
         hass, {**SAMPLE_DATA, "balance_value_eur": None, "commute_distance": None}
     )
 
-    assert hass.states.get("sensor.user_example_com_points_balance_value").state == "unknown"
-    assert hass.states.get("sensor.user_example_com_commute_distance").state == "unknown"
+    assert hass.states.get("sensor.alex_points_balance_value").state == "unknown"
+    assert hass.states.get("sensor.alex_commute_distance").state == "unknown"
 
 
 async def test_unload_makes_the_entities_unavailable(hass: HomeAssistant) -> None:
@@ -110,3 +112,36 @@ def test_config_flow_strings_cover_every_step_and_error() -> None:
         assert set(config["step"]) == expected_steps, filename
         assert set(config["error"]) == expected_errors, filename
         assert set(config["abort"]) == expected_aborts, filename
+
+
+async def test_nothing_user_visible_carries_the_account_email(hass: HomeAssistant) -> None:
+    """entity_ids, friendly_names and the device must all be free of the address.
+
+    Entity IDs are fixed at creation and travel into dashboard YAML, forum
+    posts, issues on this repo and screenshots. The email lives on the config
+    entry's data and unique_id, which are never rendered; nothing that *is*
+    rendered may repeat it. This pins the whole surface, not just the title —
+    a DeviceInfo field quietly set to the address later would fail here.
+    """
+    entry = await _setup_entry(hass, SAMPLE_DATA)
+
+    for state in hass.states.async_all("sensor"):
+        assert EMAIL not in state.entity_id
+        assert "@" not in state.entity_id
+        for value in [state.entity_id, *map(str, state.attributes.values())]:
+            assert EMAIL not in value
+            assert "example.com" not in value
+
+    device_registry = dr.async_get(hass)
+    devices = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+    assert devices
+    for device in devices:
+        rendered = [
+            device.name,
+            device.model,
+            device.manufacturer,
+            device.sw_version,
+            device.configuration_url,
+        ]
+        for value in rendered:
+            assert value is None or EMAIL not in str(value)
