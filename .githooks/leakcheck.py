@@ -188,8 +188,18 @@ def scan(
     private: list[tuple[str, str]],
     *,
     apply_generic_exemption: bool,
+    scope_label: str,
 ) -> bool:
-    """Report any match. Returns True if something was blocked."""
+    """Report any match. Returns True if something was blocked.
+
+    The block line names which gate fired — "staged changes" or "commit
+    message". That is not decoration: the test harness decides whether a case
+    passed by reading this line, and without the scope it cannot tell a content
+    block from a message block. A harness that counts the wrong gate's refusal
+    as a pass is the same fail-open this whole file exists to prevent, one level
+    up. It is also more use to a human, who otherwise has to guess which hook
+    stopped them.
+    """
     failed = False
     for pattern, why, generic in (
         [(p, w, True) for p, w in GENERIC] + [(p, w, False) for p, w in private]
@@ -209,8 +219,8 @@ def scan(
             continue
         if not failed:
             sys.stderr.write(
-                "\nleak check: BLOCKED — this commit contains content that must not be "
-                "published.\n\n"
+                "\nleak check: BLOCKED (%s) — this commit contains content that "
+                "must not be published.\n\n" % scope_label
             )
             failed = True
         sys.stderr.write("  %s:\n" % why)
@@ -254,10 +264,18 @@ def main(argv: list[str]) -> int:
             entries = [("commit message", line.rstrip("\n")) for line in fh]
         # No path, so no .githooks/ exemption applies: a commit message has no
         # legitimate reason to contain a sample LAN address.
-        failed = scan(entries, private, apply_generic_exemption=False)
+        failed = scan(
+            entries,
+            private,
+            apply_generic_exemption=False,
+            scope_label="commit message",
+        )
     else:
         failed = scan(
-            added_lines_from_staged_diff(), private, apply_generic_exemption=True
+            added_lines_from_staged_diff(),
+            private,
+            apply_generic_exemption=True,
+            scope_label="staged changes",
         )
 
     if failed:

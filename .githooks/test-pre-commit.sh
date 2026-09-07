@@ -84,12 +84,14 @@ _commit_msg() {
   return "$rc"
 }
 
+# msg_should_block <name> <message> [expected marker]
 msg_should_block() {
+  local expected="${3:-$MESSAGE_BLOCK}"
   local rc=0
   _commit_msg "$2" || rc=$?
   case "$rc" in
     0) echo "FAIL: commit-msg did NOT block: $1"; fail=$((fail + 1)) ;;
-    1) if printf '%s' "$LAST_OUT" | grep -qF "$BLOCK_MARKER"; then
+    1) if printf '%s' "$LAST_OUT" | grep -qF "$expected"; then
          echo "ok:   blocked $1"; pass=$((pass + 1))
        else
          echo "FAIL: commit failed but not via the leak check: $1"
@@ -110,18 +112,33 @@ msg_should_pass() {
   esac
 }
 
-# A commit can fail for reasons that have nothing to do with the hook — a broken
-# scratch repo, a missing mktemp, a git that would not run. Counting any failure
-# as "blocked" is the same fail-open the hook itself once had, one level up. So a
-# block only counts if the scanner said so in its own words.
-BLOCK_MARKER="leak check:"
+# A commit can fail for reasons that have nothing to do with the content under
+# test — a broken scratch repo, a git that would not run, or the OTHER hook
+# objecting to something else. Counting any failure as "blocked" is the same
+# fail-open the hook itself once had, one level up.
+#
+# So a block counts only if the scanner named the gate that fired. Matching a
+# bare "leak check:" is not enough and was actively wrong: that prefix is also
+# printed on the SUCCESS path ("generic patterns only — no identity pattern
+# file"), which every case in this suite triggers, so the marker discriminated
+# nothing. Even "leak check: BLOCKED" is too loose — a commit-msg refusal would
+# satisfy a content assertion. Hence the scope.
+CONTENT_BLOCK="leak check: BLOCKED (staged changes)"
+MESSAGE_BLOCK="leak check: BLOCKED (commit message)"
+# The two abort paths refuse for a different, legitimate reason and say so in
+# their own words. They get explicit markers rather than the default being
+# loosened to accommodate them.
+ABORT_BAD_REGEX="is not a valid regex"
+ABORT_EMPTY="exists but defines no patterns"
 
+# should_block <name> <content> [expected marker]
 should_block() {
+  local expected="${3:-$CONTENT_BLOCK}"
   local rc=0
   _commit "$2" || rc=$?
   case "$rc" in
     0) echo "FAIL: hook did NOT block: $1"; fail=$((fail + 1)) ;;
-    1) if printf '%s' "$LAST_OUT" | grep -qF "$BLOCK_MARKER"; then
+    1) if printf '%s' "$LAST_OUT" | grep -qF "$expected"; then
          echo "ok:   blocked $1"; pass=$((pass + 1))
        else
          echo "FAIL: commit failed but not via the leak check: $1"
@@ -176,7 +193,7 @@ TRAPPERS_LEAK_PATTERNS="$CANARY_FILE" should_pass "non-matching line with file l
 BAD_FILE="$WORK/bad-patterns.txt"
 printf 'ZZQQ-[unclosed\tbroken regex\n' > "$BAD_FILE"
 TRAPPERS_LEAK_PATTERNS="$BAD_FILE" should_block "corrupt pattern file aborts the commit" \
-  'entirely harmless line'
+  'entirely harmless line' "$ABORT_BAD_REGEX"
 
 # Missing pattern file: the generic half still runs (a contributor has no secrets of the
 # maintainer's to leak), and the hook says so rather than implying full coverage.
@@ -222,7 +239,7 @@ EMPTY_FILE="$WORK/empty-patterns.txt"
 printf '# only comments, no patterns\n\n' > "$EMPTY_FILE"
 TRAPPERS_LEAK_PATTERNS="$EMPTY_FILE" \
   should_block "empty pattern file aborts rather than running with no identity cover" \
-  'perfectly ordinary content'
+  'perfectly ordinary content' "$ABORT_EMPTY"
 
 echo "── commit messages are scanned too ──"
 msg_should_pass  "an ordinary commit message" 'Fix the paging offset'
@@ -244,6 +261,31 @@ echo "── a non-ASCII filename must still be scanned ──"
 PROBE_PATH='café.txt' should_block "LAN address in a non-ASCII filename" \
   'the box lives at 192.168.8.60'
 unset PROBE_PATH
+
+echo "── the harness itself must not count the wrong gate's refusal ──"
+# Regression for a harness bug, not a hook bug: a clean-content commit whose
+# MESSAGE is dirty fails, and a content assertion keyed on a bare "leak check:"
+# counted that as a content block. Every case in this suite prints that prefix
+# on the success path, so it discriminated nothing.
+_harness_self_check() {
+  fresh_repo
+  printf 'perfectly benign content\n' > "$SCRATCH/probe.txt"
+  git -C "$SCRATCH" add probe.txt
+  local out
+  out=$(git -C "$SCRATCH" commit -m 'staged on 192.168.8.60' 2>&1) && return 2
+  # The commit must have failed on the MESSAGE...
+  printf '%s' "$out" | grep -qF "$MESSAGE_BLOCK" || return 3
+  # ...and must NOT satisfy a staged-content assertion.
+  printf '%s' "$out" | grep -qF "$CONTENT_BLOCK" && return 4
+  return 0
+}
+_harness_self_check
+case "$?" in
+  0) echo "ok:   a message block is not counted as a content block"; pass=$((pass + 1)) ;;
+  2) echo "FAIL: the dirty message was not blocked at all"; fail=$((fail + 1)) ;;
+  3) echo "FAIL: blocked, but not by the commit-msg gate"; fail=$((fail + 1)) ;;
+  *) echo "FAIL: a message block still satisfies a content assertion"; fail=$((fail + 1)) ;;
+esac
 
 echo "pre-commit leak-guard: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

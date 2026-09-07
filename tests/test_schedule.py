@@ -543,3 +543,92 @@ class TestNoRedundantPollForTheSlotJustServed:
         assert interval_until_next_poll(local(2026, 9, 7, 10, 30)) == timedelta(
             minutes=30
         )
+
+
+class TestTheOffsetIsNeverConsumed:
+    """The offset is a stored property reapplied to every slot, not a token.
+
+    A sibling integration ported this and held the offset in a `_pending_jitter`
+    cleared up front, so an entry with polling disabled — or one that had taken
+    the coordinator's `_retry_after` path — spent its offset on a refresh that
+    was never scheduled and then ran forever with no spread at all, silently.
+
+    This design cannot do that: `poll_jitter()` is computed once in `__init__`
+    and passed to `interval_until_next_poll()` on every reschedule. These pin
+    that property so a future refactor toward a "pending" model fails loudly.
+    """
+
+    async def test_the_offset_survives_many_cycles_of_success_and_failure(
+        self, hass: HomeAssistant
+    ) -> None:
+        coordinator = await _coordinator(hass)
+        jitter = poll_jitter(coordinator.config_entry.entry_id)
+        pinned = local(2026, 9, 7, 12, 0)
+        expected = interval_until_next_poll(pinned, jitter)
+
+        with patch(
+            "custom_components.trappers.coordinator.dt_util.now", return_value=pinned
+        ):
+            for cycle in range(6):
+                coordinator.client.async_get_data.side_effect = (
+                    TrappersApiError("boom") if cycle % 2 else None
+                )
+                await coordinator.async_refresh()
+                # Same offset every time, whatever happened on the poll.
+                assert coordinator.update_interval == expected
+
+    async def test_polling_disabled_does_not_spend_the_offset(
+        self, hass: HomeAssistant
+    ) -> None:
+        """`_schedule_refresh` returns early for a polling-disabled entry.
+
+        The offset must still be intact and correct afterwards, because it was
+        never a one-shot in the first place.
+        """
+        coordinator = await _coordinator(hass)
+        jitter = poll_jitter(coordinator.config_entry.entry_id)
+        hass.config_entries.async_update_entry(
+            coordinator.config_entry, pref_disable_polling=True
+        )
+        pinned = local(2026, 9, 7, 12, 0)
+
+        with patch(
+            "custom_components.trappers.coordinator.dt_util.now", return_value=pinned
+        ):
+            await coordinator.async_refresh()
+
+        assert coordinator._jitter == jitter
+        assert coordinator.update_interval == interval_until_next_poll(pinned, jitter)
+
+    async def test_a_retry_after_cycle_returns_to_the_slot_grid(
+        self, hass: HomeAssistant
+    ) -> None:
+        """HA can override one interval via `UpdateFailed(retry_after=...)`.
+
+        This integration never raises that, but the base class consumes and
+        clears `_retry_after` in a single cycle either way — so even if it were
+        set externally, the following refresh returns to slot-plus-offset rather
+        than drifting off the grid.
+        """
+        coordinator = await _coordinator(hass)
+        jitter = poll_jitter(coordinator.config_entry.entry_id)
+        pinned = local(2026, 9, 7, 12, 0)
+        coordinator._retry_after = 30
+
+        with patch(
+            "custom_components.trappers.coordinator.dt_util.now", return_value=pinned
+        ):
+            await coordinator.async_refresh()
+
+        assert coordinator.update_interval == interval_until_next_poll(pinned, jitter)
+
+    async def test_the_offset_is_not_a_one_shot_attribute(self) -> None:
+        """Guards the shape itself: no `_pending_*` field to be cleared."""
+        import inspect
+
+        from custom_components.trappers import coordinator as module
+
+        source = inspect.getsource(module)
+        assert "_pending_jitter" not in source
+        # The offset is read on every reschedule, not stored-and-cleared.
+        assert source.count("self._jitter") >= 3
