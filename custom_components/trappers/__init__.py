@@ -3,14 +3,31 @@ from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import TrappersApiClient
-from .const import CONF_EMAIL, CONF_PASSWORD, DOMAIN
+from .const import CONF_EMAIL, CONF_PASSWORD, DOMAIN, SERVICE_REFRESH
 from .coordinator import TrappersCoordinator
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Register the `trappers.refresh` action (once, not per entry)."""
+
+    async def _refresh(call: ServiceCall) -> None:
+        # async_refresh, not async_request_refresh: the latter is debounced
+        # (10 s cooldown, trailing edge), and a caller that follows the action
+        # with a state check needs the poll finished when the call returns.
+        for coordinator in list(hass.data.get(DOMAIN, {}).values()):
+            await coordinator.async_refresh()
+
+    hass.services.async_register(DOMAIN, SERVICE_REFRESH, _refresh)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

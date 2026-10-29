@@ -111,8 +111,9 @@ overnight.
 
 Your sensors keep their values between updates; they do not go unavailable at
 night. Home Assistant also fetches fresh values when the integration starts, at
-whatever hour that is. To refresh immediately, use **Developer tools → Actions
-→ `homeassistant.update_entity`**, or the reload button on the integration's
+whatever hour that is. To refresh immediately, call the **`trappers.refresh`** action (Developer
+tools → Actions; it polls every account and returns when the poll is done), or
+use `homeassistant.update_entity`, or the reload button on the integration's
 entry.
 
 ## Privacy

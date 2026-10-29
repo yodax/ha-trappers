@@ -50,5 +50,11 @@
         "name": "Commute distance"
       }
     }
+  },
+  "services": {
+    "refresh": {
+      "name": "Refresh",
+      "description": "Fetch the latest points and cycling activity from Trappers right now, instead of waiting for the next scheduled update."
+    }
   }
 }

@@ -6,6 +6,8 @@ DOMAIN = "trappers"
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 
+SERVICE_REFRESH = "refresh"
+
 # Points are credited at most once per working day — when the collector unit
 # reads the bike tag on arrival at the office — so there is nothing to see
 # overnight, and this is an unofficial API belonging to an employer benefits

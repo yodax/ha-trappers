@@ -50,5 +50,11 @@
         "name": "Woon-werkafstand"
       }
     }
+  },
+  "services": {
+    "refresh": {
+      "name": "Verversen",
+      "description": "Haal de nieuwste punten en fietsactiviteit nu op bij Trappers, in plaats van op de volgende geplande update te wachten."
+    }
   }
 }
